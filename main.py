@@ -1,5 +1,6 @@
 import os, time, json, ssl, smtplib, email
 from email.message import EmailMessage
+from email.utils import make_msgid, parseaddr
 from imapclient import IMAPClient
 from dotenv import load_dotenv
 
@@ -14,36 +15,63 @@ SMTP_HOST = os.getenv("SMTP_HOST", "smtp.zoho.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
 SMTP_USER = os.getenv("SMTP_USER")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+SMTP_STARTTLS = os.getenv("SMTP_STARTTLS", "false").lower() == "true"
 
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SEC", "120"))
 SUBJECT_PREFIX = os.getenv("SUBJECT_PREFIX", "[CAIA-JOB]")
 REPLY_FROM = os.getenv("REPLY_FROM") or SMTP_USER
 ZENSPARK_INBOX = os.getenv("ZENSPARK_INBOX", "jobs@caia-agent.com")
 
-def send_mail(to_addr: str, subject: str, body_text: str):
+def _env_ready():
+    missing = []
+    for k in ["IMAP_HOST","IMAP_PORT","IMAP_USER","IMAP_PASSWORD",
+              "SMTP_HOST","SMTP_PORT","SMTP_USER","SMTP_PASSWORD"]:
+        if not os.getenv(k):
+            missing.append(k)
+    if missing:
+        print(f"[ENV] 누락 변수: {missing}")
+        return False
+    if not ZENSPARK_INBOX:
+        print("[ENV] ZENSPARK_INBOX가 비어 있음 (권장: 별도 수신함 주소 설정)")
+    if IMAP_USER and ZENSPARK_INBOX and IMAP_USER.lower() == ZENSPARK_INBOX.lower():
+        print("[WARN] ZENSPARK_INBOX가 IMAP_USER와 동일 → 자체 루프 위험. 헤더/가드로 차단 시도.")
+    safe = {
+        "IMAP_HOST": IMAP_HOST, "IMAP_PORT": IMAP_PORT, "IMAP_USER": IMAP_USER,
+        "SMTP_HOST": SMTP_HOST, "SMTP_PORT": SMTP_PORT, "SMTP_USER": SMTP_USER,
+        "REPLY_FROM": REPLY_FROM, "ZENSPARK_INBOX": ZENSPARK_INBOX
+    }
+    print("[ENV] ", safe)
+    return True
+
+def send_mail(to_addr: str, subject: str, body_text: str, extra_headers: dict | None = None):
     msg = EmailMessage()
     msg["From"] = REPLY_FROM
     msg["To"] = to_addr
     msg["Subject"] = subject
+    msg["Message-ID"] = make_msgid(domain=(REPLY_FROM or SMTP_USER).split("@")[-1])
+    if extra_headers:
+        for k, v in extra_headers.items():
+            msg[k] = str(v)
     msg.set_content(body_text)
 
     context = ssl.create_default_context()
-    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context) as s:
-        s.login(SMTP_USER, SMTP_PASSWORD)
-        s.send_message(msg)
+    # 587 또는 플래그면 STARTTLS, 아니면 SSL(465)
+    if SMTP_STARTTLS or SMTP_PORT == 587:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as s:
+            s.starttls(context=context)
+            s.login(SMTP_USER, SMTP_PASSWORD)
+            s.send_message(msg)
+    else:
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context, timeout=15) as s:
+            s.login(SMTP_USER, SMTP_PASSWORD)
+            s.send_message(msg)
 
 def parse_job_json_from_body(body: str):
-    """
-    본문에서 첫 번째 유효 JSON 블록을 찾아 파싱
-    """
     body = body.strip()
-    # 가장 단순한 케이스: 본문 전체가 JSON
     try:
-        data = json.loads(body)
-        return data
+        return json.loads(body)
     except Exception:
         pass
-    # fallback: 중괄호 시작/끝을 찾아서 추출
     start = body.find("{")
     end = body.rfind("}")
     if start != -1 and end != -1 and end > start:
@@ -54,12 +82,22 @@ def parse_job_json_from_body(body: str):
             return None
     return None
 
+def _extract_text(msg):
+    if msg.is_multipart():
+        for part in msg.walk():
+            ctype = part.get_content_type()
+            disp = (part.get("Content-Disposition") or "")
+            if ctype == "text/plain" and "attachment" not in disp:
+                return part.get_payload(decode=True).decode(part.get_content_charset() or "utf-8", errors="ignore")
+        return ""
+    return msg.get_payload(decode=True).decode(msg.get_content_charset() or "utf-8", errors="ignore")
+
 def fetch_unseen_jobs():
     context = ssl.create_default_context()
     with IMAPClient(IMAP_HOST, port=IMAP_PORT, ssl=True, ssl_context=context) as server:
         server.login(IMAP_USER, IMAP_PASSWORD)
         server.select_folder("INBOX")
-        # 제목 패턴: [CAIA-JOB]
+        # 서버측 필터: 제목만. (헤더/보낸사람 필터는 클라이언트에서 가드)
         messages = server.search(['UNSEEN', 'SUBJECT', SUBJECT_PREFIX])
         if not messages:
             return []
@@ -69,20 +107,17 @@ def fetch_unseen_jobs():
         for uid, data in fetched.items():
             raw = data[b'RFC822']
             msg = email.message_from_bytes(raw)
-            subject = str(email.header.make_header(email.header.decode_header(msg.get('Subject', ''))))
-            from_addr = email.utils.parseaddr(msg.get('From'))[1]
-            # 본문 텍스트 추출
-            body_text = ""
-            if msg.is_multipart():
-                for part in msg.walk():
-                    ctype = part.get_content_type()
-                    disp = part.get("Content-Disposition", "")
-                    if ctype == "text/plain" and "attachment" not in disp:
-                        body_text = part.get_payload(decode=True).decode(part.get_content_charset() or "utf-8", errors="ignore")
-                        break
-            else:
-                body_text = msg.get_payload(decode=True).decode(msg.get_content_charset() or "utf-8", errors="ignore")
 
+            subject = str(email.header.make_header(email.header.decode_header(msg.get('Subject', ''))))
+            from_addr = parseaddr(msg.get('From'))[1] or ""
+
+            # 루프 방지: 우리가 보낸 메일(X-CAIA-FWD/ACK) 또는 REPLY_FROM에서 온 메일은 즉시 읽음 처리 후 스킵
+            if (msg.get('X-CAIA-FWD') == '1') or (msg.get('X-CAIA-ACK') == '1') or \
+               (REPLY_FROM and from_addr.lower() == REPLY_FROM.lower()):
+                server.add_flags(uid, [b'\\Seen'])
+                continue
+
+            body_text = _extract_text(msg)
             job = {
                 "uid": uid,
                 "subject": subject,
@@ -92,16 +127,11 @@ def fetch_unseen_jobs():
             }
             jobs.append(job)
 
-            # 스레드 충돌 방지 위해 바로 읽음표시(옵션)
+            # 스레드 충돌 방지: 큐에 올린 즉시 읽음 표시
             server.add_flags(uid, [b'\\Seen'])
         return jobs
 
 def forward_to_zenspark(original_from: str, subject: str, body_json: dict):
-    """
-    젠스파크 인박스로 그대로 포워딩(브릿지 모드).
-    필요 시 여기서 intent별 라우팅/가공 넣으면 됨.
-    """
-    # 원발신자 정보를 meta에 남김
     body_json = body_json or {}
     body_json.setdefault("meta", {})
     body_json["meta"]["original_from"] = original_from
@@ -109,17 +139,18 @@ def forward_to_zenspark(original_from: str, subject: str, body_json: dict):
     send_mail(
         to_addr=ZENSPARK_INBOX,
         subject=subject,  # [CAIA-JOB] ... 그대로 전달
-        body_text=json.dumps(body_json, ensure_ascii=False, indent=2)
+        body_text=json.dumps(body_json, ensure_ascii=False, indent=2),
+        extra_headers={"X-CAIA-FWD": "1"}  # ★ 루프 방지 표식
     )
 
 def ack_to_sender(sender: str, job_id: str, ok: bool, msg: str):
     state = "accepted" if ok else "rejected"
     subject = f"[CAIA-JOB-ACK] {state} #{job_id}"
     payload = {"state": state, "message": msg}
-    send_mail(sender, subject, json.dumps(payload, ensure_ascii=False, indent=2))
+    send_mail(sender, subject, json.dumps(payload, ensure_ascii=False, indent=2),
+              extra_headers={"X-CAIA-ACK": "1"})
 
 def extract_job_id(subject: str) -> str:
-    # 예: [CAIA-JOB] video_transcribe #auto-20250809-001
     if "#" in subject:
         return subject.split("#")[-1].strip()
     return "unknown"
@@ -148,12 +179,11 @@ def main_loop():
                 print(f"Forwarded job {job_id} from {sender}")
 
         except Exception as e:
-            print("Loop error:", e)
+            print("Loop error:", repr(e))
 
         time.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":
-    required = [IMAP_USER, IMAP_PASSWORD, SMTP_USER, SMTP_PASSWORD]
-    if not all(required):
-        raise SystemExit("환경변수(IMAP_*, SMTP_*)가 설정되지 않았습니다.")
+    if not _env_ready():
+        raise SystemExit("환경변수(IMAP_*, SMTP_*) 누락으로 종료")
     main_loop()
