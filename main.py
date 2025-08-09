@@ -1,175 +1,156 @@
-import os, json, hmac, hashlib, requests
-from email.utils import parseaddr
-from dotenv import load_dotenv
-from fastapi import FastAPI, Request, Form
-from fastapi.responses import JSONResponse
++ import sqlite3, datetime
++ from pathlib import Path
++ from fastapi.responses import HTMLResponse
++ 
++ DB_PATH = Path("./mailbridge.db")
++ 
++ def _db():
++     conn = sqlite3.connect(DB_PATH)
++     conn.execute("""
++     CREATE TABLE IF NOT EXISTS mail_log(
++         id INTEGER PRIMARY KEY AUTOINCREMENT,
++         ts TEXT, direction TEXT, peer TEXT,
++         subject TEXT, snippet TEXT, meta TEXT, status TEXT
++     )
++     """)
++     return conn
++ 
++ def log_mail(direction, peer, subject, snippet, meta=None, status="queued"):
++     conn = _db()
++     conn.execute("INSERT INTO mail_log(ts,direction,peer,subject,snippet,meta,status) VALUES(?,?,?,?,?,?,?)",
++                  (datetime.datetime.utcnow().isoformat()+"Z", direction, peer, subject,
++                   (snippet or "")[:500], json.dumps(meta or {}), status))
++     conn.commit(); conn.close()
 
-load_dotenv()
-app = FastAPI()
+@@
+ def send_mail(to_addr: str, subject: str, body_text: str, extra_headers: dict | None = None):
+@@
+-    r = requests.post(
++    r = requests.post(
+         "https://api.sendgrid.com/v3/mail/send",
+@@
+-    if r.status_code >= 300:
++    if r.status_code >= 300:
+         # SendGrid가 돌려준 본문 일부 포함 (원인 파악용)
+         raise RuntimeError(f"SendGrid send failed: {r.status_code} {r.text[:240]}")
++    # 발신 성공 로그
++    try:
++        log_mail("outbound", to, subject, body_text, {"headers": extra_headers or {}}, status="sent")
++    except Exception:
++        pass
 
-# === ENV ===
-SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "")
-CAIA_INBOUND_SECRET = os.getenv("CAIA_INBOUND_SECRET", "")
-SUBJECT_PREFIX = os.getenv("SUBJECT_PREFIX", "[CAIA-JOB]")
-REPLY_FROM = os.getenv("REPLY_FROM")
-ZENSPARK_INBOX = os.getenv("ZENSPARK_INBOX")
-DIAG_TO = os.getenv("DIAG_TO", REPLY_FROM)
+@@
+ @app.post("/diag/send")
+ def diag_send():
+@@
+-        send_mail(DIAG_TO or REPLY_FROM, "[CAIA-JOB] diag #ping", '{"task":"ping"}')
+-        return {"ok": True, "sent_to": DIAG_TO or REPLY_FROM}
++        to = DIAG_TO or REPLY_FROM
++        subj = f"{SUBJECT_PREFIX} diag #ping"
++        send_mail(to, subj, '{"task":"ping"}')
++        return {"ok": True, "sent_to": to, "subject": subj}
 
-# === 공용 함수 ===
-def send_mail(to_addr: str, subject: str, body_text: str, extra_headers: dict | None = None):
-    """
-    SendGrid Web API로 메일 발송 (안정/에러 가시성↑)
-    """
-    assert SENDGRID_API_KEY, "SENDGRID_API_KEY 누락"
-    to = parseaddr(to_addr)[1] or to_addr
-    frm = parseaddr(REPLY_FROM or "")[1] or REPLY_FROM
-    payload = {
-        "personalizations": [{"to": [{"email": to}]}],
-        "from": {"email": frm},
-        "subject": subject,
-        "content": [{"type": "text/plain", "value": body_text}]
-    }
-    if extra_headers:
-        payload["headers"] = {k: str(v) for k, v in extra_headers.items()}
+@@
+ @app.post("/inbound/sendgrid")
+ async def inbound_sendgrid(
+@@
+ ):
+     sender = mail_from or from_addr or ""
+     body = text or html or ""
++    # 수신 로그(원문 요약)
++    try: log_mail("inbound", sender, subject, body, {"path":"sendgrid"}, status="received")
++    except Exception: pass
+@@
+     if not job_json:
+@@
+         try:
+             ack_to_sender(sender, job_id, False, "본문에서 유효한 Job JSON을 찾지 못했습니다.")
+         except Exception:
+             pass
+-        return {"ok": False, "reason": "no-json"}
++        return {"ok": False, "reason": "no-json"}
+@@
+     try:
+-        forward_to_zenspark(sender, subject, job_json)
++        forward_to_zenspark(sender, subject, job_json)
++        try: log_mail("forward", ZENSPARK_INBOX, subject, json.dumps(job_json)[:500], {"from": sender}, status="forwarded")
++        except Exception: pass
+         ack_to_sender(sender, job_id, True, "작업을 접수하여 젠스파크로 전달했습니다.")
+         return {"ok": True, "job_id": job_id}
+@@
+-        return JSONResponse({"ok": False, "error": str(e)}, status_code=502)
++        return JSONResponse({"ok": False, "error": str(e)}, status_code=502)
 
-    r = requests.post(
-        "https://api.sendgrid.com/v3/mail/send",
-        headers={"Authorization": f"Bearer {SENDGRID_API_KEY}", "Content-Type": "application/json"},
-        data=json.dumps(payload),
-        timeout=20,
-    )
-    if r.status_code >= 300:
-        # SendGrid가 돌려준 본문 일부 포함 (원인 파악용)
-        raise RuntimeError(f"SendGrid send failed: {r.status_code} {r.text[:240]}")
++ # --- (선택) 파라미터형 발신: 젠스파크/수신자 임의 지정 ---
++ from pydantic import BaseModel
++ class OutReq(BaseModel):
++     to: str
++     subject: str
++     body: str
++ @app.post("/outbound")
++ def outbound(req: OutReq):
++     send_mail(req.to, req.subject, req.body)
++     return {"ok": True, "to": req.to, "subject": req.subject}
 
-def parse_job_json_from_body(body: str):
-    body = (body or "").strip()
-    if not body:
-        return None
-    try:
-        return json.loads(body)
-    except Exception:
-        pass
-    s, e = body.find("{"), body.rfind("}")
-    if s != -1 and e != -1 and e > s:
-        try:
-            return json.loads(body[s:e+1])
-        except Exception:
-            return None
-    return None
++ # --- WebUI: 컬 없이 브라우저에서 발신 ---
++ @app.get("/webui", response_class=HTMLResponse)
++ def webui():
++     return f"""
++     <html><head><meta charset='utf-8'><title>Caia Mail Bridge – WebUI</title></head>
++     <body style='font-family:system-ui;max-width:720px;margin:40px auto'>
++       <h1>발신 테스트</h1>
++       <form method='post' action='/webui/send'>
++         <div>To: <input name='to' style='width:420px' value='{ZENSPARK_INBOX}'/></div>
++         <div>Subject: <input name='subject' style='width:420px' value='{SUBJECT_PREFIX} probe #WEB-001'/></div>
++         <div>Body:<br/><textarea name='body' rows='8' style='width:100%'>{{"task":"ping"}}</textarea></div>
++         <button type='submit'>Send</button>
++       </form>
++       <p><a href='/logs/ui' target='_blank'>로그 보기</a></p>
++     </body></html>"""
++ 
++ @app.post("/webui/send")
++ async def webui_send(to: str = Form(...), subject: str = Form(...), body: str = Form(...)):
++     send_mail(to, subject, body)
++     return HTMLResponse("<p>✅ Sent.</p><p><a href='/logs/ui' target='_blank'>로그 열기</a></p>")
 
-def extract_job_id(subject: str) -> str:
-    return subject.split("#")[-1].strip() if "#" in subject else "unknown"
++ # --- SendGrid Event Webhook: 배달/반송/오픈 등 영수증 ---
++ @app.post("/events")
++ async def events(request: Request):
++     try:
++         events = await request.json()  # [{event,email,...}, ...]
++     except Exception:
++         events = []
++     for ev in events:
++         peer = ev.get("email","")
++         evt  = ev.get("event","")
++         subj = f"[SG]{evt}"
++         try: log_mail("event", peer, subj, json.dumps(ev)[:200], ev, status=evt)
++         except Exception: pass
++     return {"ok": True, "count": len(events)}
 
-def forward_to_zenspark(original_from: str, subject: str, body_json: dict):
-    body_json = body_json or {}
-    body_json.setdefault("meta", {})
-    body_json["meta"]["original_from"] = parseaddr(original_from)[1] or original_from
-    send_mail(
-        to_addr=ZENSPARK_INBOX,
-        subject=subject,
-        body_text=json.dumps(body_json, ensure_ascii=False, indent=2),
-        extra_headers={"X-CAIA-FWD": "1"}
-    )
-
-def ack_to_sender(sender: str, job_id: str, ok: bool, msg: str):
-    state = "accepted" if ok else "rejected"
-    subject = f"[CAIA-JOB-ACK] {state} #{job_id}"
-    payload = {"state": state, "message": msg}
-    send_mail(
-        to_addr=sender,
-        subject=subject,
-        body_text=json.dumps(payload, ensure_ascii=False, indent=2),
-        extra_headers={"X-CAIA-ACK": "1"}
-    )
-
-# === 보안: JSON 웹훅용 HMAC 검증 (Cloudflare Email Worker → /inbound/email) ===
-def verify_sig(raw_body: bytes, sig_hex: str) -> bool:
-    if not CAIA_INBOUND_SECRET or not sig_hex:
-        return False
-    mac = hmac.new(CAIA_INBOUND_SECRET.encode(), raw_body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(mac, sig_hex)
-
-# --- 헬스/진단 ---
-@app.get("/health")
-def health():
-    ok = bool(SENDGRID_API_KEY and REPLY_FROM and ZENSPARK_INBOX)
-    return {"ok": ok, "sendgrid": bool(SENDGRID_API_KEY), "from": bool(REPLY_FROM), "to": bool(ZENSPARK_INBOX)}
-
-@app.post("/diag/send")
-def diag_send():
-    """전송 경로 진단: DIAG_TO로 테스트 메일 1통 발송"""
-    try:
-        send_mail(DIAG_TO or REPLY_FROM, "[CAIA-JOB] diag #ping", '{"task":"ping"}')
-        return {"ok": True, "sent_to": DIAG_TO or REPLY_FROM}
-    except Exception as e:
-        # 왜 막혔는지 바로 확인 가능
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=502)
-
-# --- 인바운드 #1: SendGrid Inbound Parse (multipart/form-data) ---
-@app.post("/inbound/sendgrid")
-async def inbound_sendgrid(
-    request: Request,
-    mail_from: str = Form(default=""),
-    from_addr: str = Form(default=""),
-    to: str = Form(default=""),
-    subject: str = Form(default=""),
-    text: str = Form(default=""),
-    html: str = Form(default=""),
-):
-    sender = mail_from or from_addr or ""
-    body = text or html or ""
-    if SUBJECT_PREFIX not in subject:
-        return {"ok": True, "skip": "no-prefix"}
-
-    job_json = parse_job_json_from_body(body)
-    job_id = extract_job_id(subject)
-
-    if not job_json:
-        # 본문에 JSON이 없을 때는 발신자에게 실패 ACK 시도
-        try:
-            ack_to_sender(sender, job_id, False, "본문에서 유효한 Job JSON을 찾지 못했습니다.")
-        except Exception:
-            pass
-        return {"ok": False, "reason": "no-json"}
-
-    try:
-        forward_to_zenspark(sender, subject, job_json)
-        ack_to_sender(sender, job_id, True, "작업을 접수하여 젠스파크로 전달했습니다.")
-        return {"ok": True, "job_id": job_id}
-    except Exception as e:
-        # 여기서 500을 주면 SendGrid가 재시도함(의도적)
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=502)
-
-# --- 인바운드 #2: Cloudflare Email Worker (application/json + X-CAIA-SIGN) ---
-@app.post("/inbound/email")
-async def inbound_email(request: Request):
-    raw = await request.body()
-    sig = request.headers.get("x-caia-sign", "")
-    if not verify_sig(raw, sig):
-        return JSONResponse({"ok": False, "error": "bad-signature"}, status_code=401)
-
-    data = json.loads(raw.decode("utf-8"))
-    subject = data.get("subject","")
-    text = data.get("text","") or data.get("html","") or ""
-    sender = data.get("from","")
-
-    if SUBJECT_PREFIX not in subject:
-        return {"ok": True, "skip": "no-prefix"}
-
-    job_json = parse_job_json_from_body(text)
-    job_id = extract_job_id(subject)
-
-    if not job_json:
-        try:
-            ack_to_sender(sender, job_id, False, "본문에서 유효한 Job JSON을 찾지 못했습니다.")
-        except Exception:
-            pass
-        return {"ok": False, "reason": "no-json"}
-
-    try:
-        forward_to_zenspark(sender, subject, job_json)
-        ack_to_sender(sender, job_id, True, "작업을 접수하여 젠스파크로 전달했습니다.")
-        return {"ok": True, "job_id": job_id}
-    except Exception as e:
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=502)
++ # --- Logs API/UI ---
++ @app.get("/logs")
++ def logs(limit: int = 150):
++     conn = _db()
++     cur = conn.execute("SELECT ts,direction,peer,subject,status FROM mail_log ORDER BY id DESC LIMIT ?", (limit,))
++     rows = [{"ts":r[0],"dir":r[1],"peer":r[2],"subject":r[3],"status":r[4]} for r in cur.fetchall()]
++     conn.close()
++     return {"ok": True, "rows": rows}
++ 
++ @app.get("/logs/ui", response_class=HTMLResponse)
++ def logs_ui():
++     return """
++     <html><head><meta charset='utf-8'><title>Logs</title>
++     <style>body{font-family:system-ui;max-width:960px;margin:30px auto}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ddd;padding:6px}</style>
++     <script>
++       async function load(){const r=await fetch('/logs?limit=200');const j=await r.json();
++         const el=document.getElementById('tbl'); el.innerHTML='';
++         (j.rows||[]).forEach(row=>{const tr=document.createElement('tr');
++           ['ts','dir','peer','subject','status'].forEach(k=>{const td=document.createElement('td');td.textContent=row[k];tr.appendChild(td);});
++           el.appendChild(tr);});}
++       setInterval(load,2000); window.onload=load;
++     </script></head>
++     <body><h2>Caia Mail Logs</h2>
++     <table><thead><tr><th>ts</th><th>dir</th><th>peer</th><th>subject</th><th>status</th></tr></thead>
++     <tbody id='tbl'></tbody></table></body></html>
++     """
