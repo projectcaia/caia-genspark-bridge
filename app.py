@@ -10,7 +10,7 @@ APP = FastAPI(title="Caia Mail Bridge – SendGrid")
 
 # ── ENV
 SENDER_DEFAULT = os.getenv("SENDER_DEFAULT")           # 예: axel.nam@caia-agent.com
-INBOUND_TOKEN  = os.getenv("INBOUND_TOKEN")            # 예: G2k7n9q4YxW3t8P5
+INBOUND_TOKEN  = os.getenv("INBOUND_TOKEN")            # 예: 랜덤 토큰
 
 # ── Schemas
 class SendReq(BaseModel):
@@ -34,9 +34,11 @@ def on_startup():
 # ── 발신(JSON)
 @APP.post("/mail/send")
 async def api_send(req: SendReq):
+    subject = (req.subject or "").strip() or "(제목 없음)"
+    text = (req.text or "").strip() or "(내용 없음)"
     await send_email_sg(
-        mail_from=SENDER_DEFAULT, to=req.to, subject=req.subject,
-        text=req.text, html=req.html, cc=req.cc, bcc=req.bcc,
+        mail_from=SENDER_DEFAULT, to=req.to, subject=subject,
+        text=text, html=req.html, cc=req.cc, bcc=req.bcc,
         attachments_b64=req.attachments_b64
     )
     return {"ok": True}
@@ -45,17 +47,20 @@ async def api_send(req: SendReq):
 @APP.post("/mail/send-form")
 async def api_send_form(
     to: str = Form(...),
-    subject: str = Form(...),
+    subject: str = Form(""),
     text: str = Form(""),
     html: str = Form(None),
     files: List[UploadFile] = File(default_factory=list),
 ):
+    subject = (subject or "").strip() or "(제목 없음)"
+    text = (text or "").strip() or "(내용 없음)"
     atts = []
     for f in files:
         b = await f.read()
         atts.append({"filename": f.filename, "content_b64": base64.b64encode(b).decode()})
     await send_email_sg(
-        mail_from=SENDER_DEFAULT, to=[x.strip() for x in to.split(",") if x.strip()],
+        mail_from=SENDER_DEFAULT,
+        to=[x.strip() for x in to.split(",") if x.strip()],
         subject=subject, text=text, html=html, attachments_b64=atts
     )
     return {"ok": True}
@@ -63,29 +68,29 @@ async def api_send_form(
 # ── 자연어 → 발신(JSON)
 @APP.post("/mail/nl")
 async def api_nl(req: NLReq):
+    cmd = (req.command or "").strip()
     to = req.default_to or []
-    subj = None
-    body = None
-
-    emails = re.findall(r'[\w\.-]+@[\w\.-]+\.\w+', req.command)
+    # 이메일 추출
+    emails = re.findall(r'[\w\.-]+@[\w\.-]+\.\w+', cmd)
     if emails:
-        to = list(set(to + emails))
-
-    m_subj = re.search(r'(제목|subject)\s*(은|:)\s*(.+?)(,|내용|보내|끝|$)', req.command)
-    if m_subj:
-        subj = m_subj.group(3).strip()
-
-    m_body = re.search(r'(내용|message|body)\s*(은|:)\s*(.+)$', req.command)
-    if m_body:
-        body = m_body.group(3).strip()
-
+        to = list({*to, *emails})
+    # 제목/내용 느슨한 파싱
+    m_subj = re.search(r'(?:제목|subject)\s*(?:은|:)?\s*([^\n,]+)', cmd, flags=re.IGNORECASE)
+    m_body = re.search(r'(?:내용|message|body)\s*(?:은|:)?\s*(.+)$', cmd, flags=re.IGNORECASE)
+    subj = (m_subj.group(1).strip() if m_subj else "").strip().strip('"').strip("'")
+    body = (m_body.group(1).strip() if m_body else "").strip()
     if not body:
-        body = req.command
+        # 제목 뒤 꼬리부분에서 내용 추정
+        if subj and subj in cmd:
+            tail = cmd.split(subj, 1)[-1]
+            m2 = re.search(r'(?:내용|보내)\s*(?:은|를|:)?\s*(.+)$', tail)
+            if m2:
+                body = m2.group(1).strip()
+    # 기본값
+    subj = subj or "(제목 없음)"
+    body = body or "(내용 없음)"
     if not to:
         return {"ok": False, "error": "받는사람 이메일이 필요해. 'to: user@example.com' 포함해줘."}
-    if not subj:
-        subj = "(제목 없음)"
-
     await send_email_sg(mail_from=SENDER_DEFAULT, to=to, subject=subj, text=body)
     return {"ok": True, "to": to, "subject": subj}
 
@@ -98,8 +103,8 @@ async def inbound_parse(request: Request, token: str):
     form = await request.form()
     frm     = form.get("from", "")
     to_rcpt = form.get("to", "")
-    subject = form.get("subject", "")
-    text    = form.get("text", "") or ""
+    subject = (form.get("subject", "") or "").strip() or "(제목 없음)"
+    text    = (form.get("text", "") or "").strip() or "(내용 없음)"
     html    = form.get("html", None)
 
     # 첨부
@@ -122,7 +127,7 @@ async def inbound_parse(request: Request, token: str):
         "to": to_rcpt,
         "subject": subject,
         "date": time.strftime("%a, %d %b %Y %H:%M:%S %z"),
-        "text": (text or "").strip(),
+        "text": text,
         "html": html,
         "attachments": attachments
     }])
@@ -148,8 +153,8 @@ async def api_send_raw(request: Request):
     except Exception as e:
         return {"ok": False, "parse_error": str(e), "raw_sample": raw[:120].decode("utf-8", "ignore")}
     to = data.get("to") or []
-    subject = data.get("subject") or "(제목 없음)"
-    text = data.get("text") or ""
+    subject = (data.get("subject") or "").strip() or "(제목 없음)"
+    text = (data.get("text") or "").strip() or "(내용 없음)"
     html = data.get("html")
     cc = data.get("cc")
     bcc = data.get("bcc")
@@ -165,7 +170,6 @@ async def api_send_raw(request: Request):
 @APP.post("/mail/nl-raw")
 async def api_nl_raw(request: Request):
     raw = await request.body()
-    # JSON이든 plain text든 모두 허용
     try:
         data = json.loads(raw.decode("utf-8", "ignore"))
         command = data.get("command", "")
@@ -174,15 +178,22 @@ async def api_nl_raw(request: Request):
 
     emails = re.findall(r'[\w\.-]+@[\w\.-]+\.\w+', command)
     to = list(set(emails))
-    subj = None
-    body = None
-    m_subj = re.search(r'(제목|subject)\s*(은|:)\s*(.+?)(,|내용|보내|끝|$)', command)
-    if m_subj: subj = m_subj.group(3).strip()
-    m_body = re.search(r'(내용|message|body)\s*(은|:)\s*(.+)$', command)
-    if m_body: body = m_body.group(3).strip()
-    if not body: body = command
-    if not to:   return {"ok": False, "error": "받는사람 이메일 필요. 'to: user@example.com' 포함해줘."}
-    if not subj: subj = "(제목 없음)"
+
+    m_subj = re.search(r'(?:제목|subject)\s*(?:은|:)?\s*([^\n,]+)', command, flags=re.IGNORECASE)
+    m_body = re.search(r'(?:내용|message|body)\s*(?:은|:)?\s*(.+)$', command, flags=re.IGNORECASE)
+    subj = (m_subj.group(1).strip() if m_subj else "")
+    body = (m_body.group(1).strip() if m_body else "")
+
+    if not body and subj and subj in command:
+        tail = command.split(subj, 1)[-1]
+        m2 = re.search(r'(?:내용|보내)\s*(?:은|를|:)?\s*(.+)$', tail)
+        if m2:
+            body = m2.group(1).strip()
+
+    subj = subj.strip().strip('"').strip("'") or "(제목 없음)"
+    body = body or "(내용 없음)"
+    if not to:
+        return {"ok": False, "error": "받는사람 이메일 필요. 'to: user@example.com' 포함해줘."}
     await send_email_sg(mail_from=SENDER_DEFAULT, to=to, subject=subj, text=body)
     return {"ok": True, "to": to, "subject": subj}
 
@@ -190,10 +201,7 @@ async def api_nl_raw(request: Request):
 @APP.post("/debug/echo")
 async def debug_echo(request: Request):
     raw = await request.body()
-    return {
-        "len": len(raw),
-        "raw": raw.decode("utf-8", "ignore")
-    }
+    return {"len": len(raw), "raw": raw.decode("utf-8", "ignore")}
 
 # ── 헬스체크
 @APP.get("/health")
