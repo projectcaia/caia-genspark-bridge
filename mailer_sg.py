@@ -16,17 +16,18 @@ async def send_email_sg(
     bcc: Optional[List[str]] = None,
     attachments_b64: Optional[List[dict]] = None,
 ):
+    subject = (subject or "").strip() or "(제목 없음)"
+    text = (text or "").strip() or "(내용 없음)"
+
     msg = Mail(
         from_email=Email(mail_from),
         to_emails=[To(x) for x in to],
         subject=subject,
-        plain_text_content=text or None,
+        plain_text_content=text,
         html_content=html if html else None,
     )
-    if cc:
-        msg.cc = [Cc(x) for x in cc]
-    if bcc:
-        msg.bcc = [Bcc(x) for x in bcc]
+    if cc:  msg.cc  = [Cc(x) for x in cc]
+    if bcc: msg.bcc = [Bcc(x) for x in bcc]
     if attachments_b64:
         msg.attachments = [
             Attachment(
@@ -39,8 +40,18 @@ async def send_email_sg(
         ]
 
     loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, _send_blocking, msg)
+    return await loop.run_in_executor(None, _send_blocking, msg)
 
 def _send_blocking(msg: Mail):
     sg = SendGridAPIClient(SG_API_KEY)
-    sg.send(msg)
+    resp = sg.send(msg)
+    # 진단 로그
+    try:
+        print("[SendGrid] status:", resp.status_code)
+        print("[SendGrid] body:", resp.body.decode() if hasattr(resp.body, "decode") else resp.body)
+        print("[SendGrid] headers:", dict(resp.headers))
+    except Exception:
+        pass
+    if int(resp.status_code) >= 400:
+        raise RuntimeError(f"SendGrid error {resp.status_code}")
+    return {"status": int(resp.status_code)}
