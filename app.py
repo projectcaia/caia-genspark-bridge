@@ -1,5 +1,5 @@
 # app.py
-import os, base64, re, time
+import os, base64, re, time, json
 from typing import List, Optional
 from fastapi import FastAPI, UploadFile, File, Form, Request, HTTPException
 from pydantic import BaseModel, Field
@@ -60,7 +60,7 @@ async def api_send_form(
     )
     return {"ok": True}
 
-# ── 자연어 → 발신
+# ── 자연어 → 발신(JSON)
 @APP.post("/mail/nl")
 async def api_nl(req: NLReq):
     to = req.default_to or []
@@ -138,6 +138,62 @@ async def inbound_alias(request: Request, token: str):
 async def api_new(since_id: Optional[int] = None, limit: int = 20):
     rows = list_messages_since(since_id, limit)
     return {"ok": True, "messages": rows}
+
+# ── 호환용: 윈도우/셸 JSON 파싱 이슈 우회 (raw body 직접 처리)
+@APP.post("/mail/send-raw")
+async def api_send_raw(request: Request):
+    raw = await request.body()
+    try:
+        data = json.loads(raw.decode("utf-8", "ignore"))
+    except Exception as e:
+        return {"ok": False, "parse_error": str(e), "raw_sample": raw[:120].decode("utf-8", "ignore")}
+    to = data.get("to") or []
+    subject = data.get("subject") or "(제목 없음)"
+    text = data.get("text") or ""
+    html = data.get("html")
+    cc = data.get("cc")
+    bcc = data.get("bcc")
+    atts = data.get("attachments_b64")
+    if not to:
+        return {"ok": False, "error": "to가 필요합니다."}
+    await send_email_sg(
+        mail_from=SENDER_DEFAULT, to=to, subject=subject,
+        text=text, html=html, cc=cc, bcc=bcc, attachments_b64=atts
+    )
+    return {"ok": True}
+
+@APP.post("/mail/nl-raw")
+async def api_nl_raw(request: Request):
+    raw = await request.body()
+    # JSON이든 plain text든 모두 허용
+    try:
+        data = json.loads(raw.decode("utf-8", "ignore"))
+        command = data.get("command", "")
+    except Exception:
+        command = raw.decode("utf-8", "ignore")
+
+    emails = re.findall(r'[\w\.-]+@[\w\.-]+\.\w+', command)
+    to = list(set(emails))
+    subj = None
+    body = None
+    m_subj = re.search(r'(제목|subject)\s*(은|:)\s*(.+?)(,|내용|보내|끝|$)', command)
+    if m_subj: subj = m_subj.group(3).strip()
+    m_body = re.search(r'(내용|message|body)\s*(은|:)\s*(.+)$', command)
+    if m_body: body = m_body.group(3).strip()
+    if not body: body = command
+    if not to:   return {"ok": False, "error": "받는사람 이메일 필요. 'to: user@example.com' 포함해줘."}
+    if not subj: subj = "(제목 없음)"
+    await send_email_sg(mail_from=SENDER_DEFAULT, to=to, subject=subj, text=body)
+    return {"ok": True, "to": to, "subject": subj}
+
+# ── 디버그: 수신 바디 확인용
+@APP.post("/debug/echo")
+async def debug_echo(request: Request):
+    raw = await request.body()
+    return {
+        "len": len(raw),
+        "raw": raw.decode("utf-8", "ignore")
+    }
 
 # ── 헬스체크
 @APP.get("/health")
