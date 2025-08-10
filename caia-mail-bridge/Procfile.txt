@@ -1,5 +1,0 @@
-worker: python main.py
-
-
-
-
