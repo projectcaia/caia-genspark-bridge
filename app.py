@@ -173,47 +173,95 @@ async def api_nl(req: NLReq):
     return {"ok": True, "to": to, "subject": subj}
 
 # ── 수신(Webhook: SendGrid Inbound Parse)
+from fastapi import Body
+
 @APP.post("/inbound/sen")
 async def inbound_parse(request: Request, token: str):
+    """
+    SendGrid Inbound Parse 웹훅 엔드포인트.
+    - token 쿼리스트링으로 간단 인증
+    - multipart/form-data / application/x-www-form-urlencoded 모두 처리
+    - DB 저장 → 분류/중요도 → 스레드 전달(+AUTO_RUN) → (조건)텔레그램 알림
+    """
+    # 1) 토큰 검증
     if INBOUND_TOKEN and token != INBOUND_TOKEN:
         raise HTTPException(401, "invalid token")
-    form = await request.form()
-    frm     = form.get("from", ""); to_rcpt = form.get("to", "")
+
+    # 2) 폼 파싱 (multipart / urlencoded 호환)
+    try:
+        form = await request.form()
+    except Exception:
+        # 일부 케이스에서 form() 파싱 실패시 urlencoded 대비
+        raw = await request.body()
+        try:
+            from urllib.parse import parse_qs
+            form = {k: v[0] if isinstance(v, list) else v for k, v in parse_qs(raw.decode("utf-8", "ignore")).items()}
+        except Exception:
+            form = {}
+
+    frm     = form.get("from", "") if isinstance(form, dict) else form.get("from", "")
+    to_rcpt = form.get("to", "")   if isinstance(form, dict) else form.get("to", "")
     subject = (form.get("subject", "") or "").strip() or "(제목 없음)"
     text    = (form.get("text", "") or "").strip() or "(내용 없음)"
     html    = form.get("html", None)
 
+    # 3) 첨부 수집
     attachments = []
-    try: n = int(form.get("attachments", 0))
-    except: n = 0
+    try:
+        n = int(form.get("attachments", 0))
+    except Exception:
+        n = 0
     for i in range(1, n + 1):
         f = form.get(f"attachment{i}")
-        if hasattr(f, "filename"):
+        if hasattr(f, "filename"):  # Starlette UploadFile
             b = await f.read()
-            attachments.append({"filename": f.filename, "content_b64": base64.b64encode(b).decode()})
+            attachments.append({
+                "filename": f.filename,
+                "content_b64": base64.b64encode(b).decode()
+            })
 
+    # 4) 저장
     save_messages([{
-        "from": frm, "to": to_rcpt, "subject": subject,
+        "from": frm,
+        "to": to_rcpt,
+        "subject": subject,
         "date": time.strftime("%a, %d %b %Y %H:%M:%S %z"),
-        "text": text, "html": html, "attachments": attachments
+        "text": text,
+        "html": html,
+        "attachments": attachments
     }])
 
+    # 5) 게이트웨이: 분류 → 스레드 기록 → (옵션)Run → (옵션)텔레그램
     try:
         tag = classify_email(frm, subject, text)
         imp = importance_score(tag, subject, text)
-        ok, info = push_to_thread_and_maybe_run(tag, frm, to_rcpt, subject, text)
+
+        ok, _ = push_to_thread_and_maybe_run(tag, frm, to_rcpt, subject, text)
+
         if (tag in ALERT_CLASSES) or (imp >= ALERT_IMPORTANCE_MIN):
-            send_telegram(f"📬 {tag} 메일 감지\n제목: {subject}\n보낸사람: {frm}\n중요도: {imp:.2f}\n"
-                          f"→ 스레드 기록{' 및 판단 실행' if AUTO_RUN else ''}")
+            send_telegram(
+                f"📬 {tag} 메일 감지\n"
+                f"제목: {subject}\n보낸사람: {frm}\n"
+                f"중요도: {imp:.2f}\n"
+                f"→ 스레드 기록{' 및 판단 실행' if AUTO_RUN else ''}"
+            )
     except Exception as e:
+        # 인바운드 훅은 200을 유지해야 SendGrid 재시도폭격을 막을 수 있음
         send_telegram(f"⚠️ Caia 게이트웨이 처리 실패: {e}")
 
     return {"ok": True}
 
+# ── SendGrid 콘솔에 /inbound/sendgrid 로 등록된 경우 호환용 alias
+@APP.post("/inbound/sendgrid")
+async def inbound_alias(request: Request, token: str):
+    return await inbound_parse(request, token)
+
+
 # ── 최근 수신(HTML/JSON)
 @APP.get("/inbox", response_class=HTMLResponse)
 def inbox(limit: int = 10, token: Optional[str] = None):
-    if not _guard(token): return HTMLResponse("<h3>401 Unauthorized</h3>", status_code=401)
+    if not _guard(token):
+        return HTMLResponse("<h3>401 Unauthorized</h3>", status_code=401)
     rows = list_messages_since(None, limit)
     rows_html = "".join([
         f"<li><b>{r.get('subject','')}</b><br/>From: {r.get('from','')}<br/>To: {r.get('to','')}<br/>"
@@ -224,6 +272,7 @@ def inbox(limit: int = 10, token: Optional[str] = None):
 
 @APP.get("/inbox.json")
 def inbox_json(limit: int = 10, token: Optional[str] = None):
-    if not _guard(token): return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    if not _guard(token):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
     rows = list_messages_since(None, limit)
     return {"ok": True, "messages": rows}
