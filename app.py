@@ -7,6 +7,90 @@ from pydantic import BaseModel, Field
 from mailer_sg import send_email_sg
 from store import init_db, save_messages, list_messages_since
 
+# === Caia / Assistants & Telegram (추가) ===
+import requests
+from openai import OpenAI
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+ASSISTANT_ID   = os.getenv("ASSISTANT_ID")
+THREAD_ID      = os.getenv("THREAD_ID")
+TG_TOKEN       = os.getenv("TELEGRAM_BOT_TOKEN")
+TG_CHAT_ID     = os.getenv("TELEGRAM_CHAT_ID")
+
+# 정책값 (알림/자동실행)
+AUTO_RUN = os.getenv("AUTO_RUN", "true").lower() == "true"
+ALERT_CLASSES = set([c.strip().upper() for c in os.getenv("ALERT_CLASSES", "SENTINEL,REFLEX,ZENSPARK").split(",") if c.strip()])
+ALERT_IMPORTANCE_MIN = float(os.getenv("ALERT_IMPORTANCE_MIN", "0.6"))
+
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+def send_telegram(text: str):
+    if not (TG_TOKEN and TG_CHAT_ID):
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json={"chat_id": TG_CHAT_ID, "text": text}
+        )
+    except Exception:
+        pass
+
+def safe_trunc(s: str, n: int = 3000) -> str:
+    s = s or ""
+    return s if len(s) <= n else s[:n] + "\n...[truncated]"
+
+# 리플렉스 키워드(간단 규칙)
+REFLEX_KEYS = [r"\bΔ?K200\b", r"\bCOVIX\b", r"\bKOSPI200_F\b", r"\bVIX\b"]
+
+def classify_email(frm: str, subject: str, text: str) -> str:
+    s = (subject or "").lower()
+    f = (frm or "").lower()
+    t = (text or "")
+    # 우선순위: SENTINEL > REFLEX > ZENSPARK > OTHER
+    if "sentinel" in s or "[sentinel]" in s:
+        return "SENTINEL"
+    if "[reflex]" in s or any(re.search(k, t, re.IGNORECASE) for k in REFLEX_KEYS):
+        return "REFLEX"
+    if "zenspark" in f or "zenspark" in s:
+        return "ZENSPARK"
+    return "OTHER"
+
+def importance_score(tag: str, subject: str, text: str) -> float:
+    score = 0.0
+    tag = (tag or "OTHER").upper()
+    s = (subject or "").lower()
+    t = (text or "").lower()
+    if tag == "SENTINEL": score += 0.8
+    if tag == "REFLEX":   score += 0.7
+    if tag == "ZENSPARK": score += 0.5
+    for kw in ["급락","급등","panic","spike","alert","경보","임계"]:
+        if kw in s or kw in t:
+            score += 0.1
+    return min(score, 1.0)
+
+def push_to_thread_and_maybe_run(tag: str, frm: str, to_rcpt: str, subject: str, text: str):
+    """스레드에 메시지 기록하고, AUTO_RUN이면 Run 실행."""
+    if not (client and ASSISTANT_ID and THREAD_ID):
+        return False, "OpenAI client/IDs missing"
+    content = (
+        f"[{tag}] inbound mail\n"
+        f"From: {frm}\nTo: {to_rcpt}\nSubject: {subject}\n\n"
+        f"{safe_trunc(text)}"
+    )
+    client.beta.threads.messages.create(
+        thread_id=THREAD_ID,
+        role="user",
+        content=content
+    )
+    if AUTO_RUN:
+        client.beta.threads.runs.create(
+            thread_id=THREAD_ID,
+            assistant_id=ASSISTANT_ID,
+            instructions="센티넬/리플렉스/젠스파크 메일이면 요약 및 전략 초안 생성"
+        )
+    return True, "ok"
+# === Caia / Assistants & Telegram (추가 끝) ===
+
 APP = FastAPI(title="Caia Mail Bridge – SendGrid")
 
 # ── ENV
@@ -141,115 +225,25 @@ async def inbound_parse(request: Request, token: str):
         "html": html,
         "attachments": attachments
     }])
-    return {"ok": True}
 
-# ── SendGrid 목적지 URL이 /inbound/sendgrid 인 경우 호환용 alias
-@APP.post("/inbound/sendgrid")
-async def inbound_alias(request: Request, token: str):
-    return await inbound_parse(request, token)
-
-# ── 새 메일 조회(JSON)
-@APP.get("/mail/new")
-async def api_new(since_id: Optional[int] = None, limit: int = 20):
-    rows = list_messages_since(since_id, limit)
-    return {"ok": True, "messages": rows}
-
-# ── 호환용: 윈도우/셸 JSON 파싱 이슈 우회 (raw body 직접 처리)
-@APP.post("/mail/send-raw")
-async def api_send_raw(request: Request):
-    raw = await request.body()
+    # === Caia Gateway Hook: 분류 → 스레드 기록 → (옵션) Run → (옵션) 텔레그램 알림 ===
     try:
-        data = json.loads(raw.decode("utf-8", "ignore"))
+        tag = classify_email(frm, subject, text)
+        imp = importance_score(tag, subject, text)
+
+        ok, info = push_to_thread_and_maybe_run(tag, frm, to_rcpt, subject, text)
+
+        if (tag in ALERT_CLASSES) or (imp >= ALERT_IMPORTANCE_MIN):
+            send_telegram(
+                f"📬 {tag} 메일 감지\n"
+                f"제목: {subject}\n보낸사람: {frm}\n"
+                f"중요도: {imp:.2f}\n"
+                f"→ 스레드 기록{' 및 판단 실행' if AUTO_RUN else ''}"
+            )
     except Exception as e:
-        return {"ok": False, "parse_error": str(e), "raw_sample": raw[:120].decode("utf-8", "ignore")}
-    to = data.get("to") or []
-    subject = (data.get("subject") or "").strip() or "(제목 없음)"
-    text    = (data.get("text") or "").strip() or "(내용 없음)"
-    html = data.get("html")
-    cc = data.get("cc")
-    bcc = data.get("bcc")
-    atts = data.get("attachments_b64")
-    if not to:
-        return {"ok": False, "error": "to가 필요합니다."}
-    await send_email_sg(
-        mail_from=SENDER_DEFAULT, to=to, subject=subject,
-        text=text, html=html, cc=cc, bcc=bcc, attachments_b64=atts
-    )
+        # Inbound 비활성화 방지: 실패는 알리고 200은 유지
+        send_telegram(f"⚠️ Caia 게이트웨이 처리 실패: {e}")
+
     return {"ok": True}
 
-@APP.post("/mail/nl-raw")
-async def api_nl_raw(request: Request):
-    raw = await request.body()
-    try:
-        data = json.loads(raw.decode("utf-8", "ignore"))
-        command = data.get("command", "")
-    except Exception:
-        command = raw.decode("utf-8", "ignore")
-
-    emails = re.findall(r'[\w\.-]+@[\w\.-]+\.\w+', command)
-    to = list(set(emails))
-    m_subj = re.search(r'(?:제목|subject)\s*(?:은|:)?\s*([^\n,]+)', command, flags=re.IGNORECASE)
-    m_body = re.search(r'(?:내용|message|body)\s*(?:은|:)?\s*(.+)$', command, flags=re.IGNORECASE)
-    subj = (m_subj.group(1).strip() if m_subj else "") if m_subj else ""
-    body = (m_body.group(1).strip() if m_body else "") if m_body else ""
-
-    subj = (subj or "").strip().strip('"').strip("'") or "(제목 없음)"
-    body = (body or "").strip() or "(내용 없음)"
-    if not to:
-        return {"ok": False, "error": "받는사람 이메일 필요. 'to: user@example.com' 포함해줘."}
-    await send_email_sg(mail_from=SENDER_DEFAULT, to=to, subject=subj, text=body)
-    return {"ok": True, "to": to, "subject": subj}
-
-# ── 디버그: 수신 바디 확인용
-@APP.post("/debug/echo")
-async def debug_echo(request: Request):
-    raw = await request.body()
-    return {"len": len(raw), "raw": raw.decode("utf-8", "ignore")}
-
-# ── 폰 자가진단: 상태/발신/수신(HTML)
-@APP.get("/status", response_class=HTMLResponse)
-async def status(token: Optional[str] = None):
-    if not _guard(token):
-        return HTMLResponse("<h3>401 Unauthorized</h3>", status_code=401)
-    return HTMLResponse(f"""
-    <html><body>
-      <h2>Caia Mail Bridge: OK</h2>
-      <ul>
-        <li>Sender: {SENDER_DEFAULT}</li>
-        <li>Inbound token set: {"YES" if INBOUND_TOKEN else "NO"}</li>
-      </ul>
-      <p><a href="/inbox?limit=10&token={token or ''}">최근 수신 보기</a></p>
-    </body></html>""")
-
-@APP.get("/selftest/send")
-async def selftest_send(to: str, subj: str = "자가진단", text: str = "모바일 발신 OK", token: Optional[str] = None):
-    if not _guard(token):
-        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
-    subj = (subj or "").strip() or "(제목 없음)"
-    text = (text or "").strip() or "(내용 없음)"
-    await send_email_sg(mail_from=SENDER_DEFAULT, to=[to], subject=subj, text=text)
-    return {"ok": True, "to": to, "subject": subj, "text": text}
-
-@APP.get("/inbox", response_class=HTMLResponse)
-async def inbox(limit: int = 10, token: Optional[str] = None):
-    if not _guard(token):
-        return HTMLResponse("<h3>401 Unauthorized</h3>", status_code=401)
-    rows = list_messages_since(None, limit)
-    rows_html = "".join([
-        f"<li><b>{r.get('subject','')}</b><br/>From: {r.get('from','')}<br/>To: {r.get('to','')}<br/>"
-        f"<pre style='white-space:pre-wrap'>{(r.get('text','') or '')[:1000]}</pre><hr/></li>"
-        for r in rows
-    ]) or "<li>(수신 없음)</li>"
-    return HTMLResponse(f"<html><body><h2>최근 수신 {limit}개</h2><ul>{rows_html}</ul></body></html>")
-
-@APP.get("/inbox.json")
-async def inbox_json(limit: int = 10, token: Optional[str] = None):
-    if not _guard(token):
-        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
-    rows = list_messages_since(None, limit)
-    return {"ok": True, "messages": rows}
-
-# ── 헬스체크
-@APP.get("/health")
-async def health():
-    return {"ok": True, "sender": SENDER_DEFAULT}
+# ── SendGrid 목적지 URL이 /inbound/sen
