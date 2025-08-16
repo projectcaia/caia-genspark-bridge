@@ -5,7 +5,15 @@ from typing import List, Dict, Optional
 DB_PATH = os.getenv("DB_PATH", "mailbridge.sqlite3")
 
 def _conn():
-    return sqlite3.connect(DB_PATH)
+    """
+    - WAL 모드 + NORMAL 동기화로 동시성/성능 향상
+    - check_same_thread=False: FastAPI 스레드 환경에서 안전하게 사용
+    """
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
 
 def _get_msg_columns(c) -> List[str]:
     cur = c.execute("PRAGMA table_info(msg)")
@@ -15,25 +23,47 @@ def _table_exists(c, name: str) -> bool:
     cur = c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,))
     return cur.fetchone() is not None
 
+def _ensure_new_schema(c):
+    """
+    신 스키마(id AUTOINCREMENT) 없으면 생성.
+    필요한 보조 인덱스도 같이 생성.
+    """
+    if not _table_exists(c, "msg"):
+        c.execute("""
+            CREATE TABLE msg (
+                id   INTEGER PRIMARY KEY AUTOINCREMENT,
+                frm  TEXT,
+                rcpt TEXT,
+                subj TEXT,
+                dt   TEXT,
+                text TEXT,
+                html TEXT,
+                atts TEXT,
+                ts   INTEGER
+            )
+        """)
+    # 인덱스(존재하면 무시)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_msg_id ON msg(id)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_msg_ts ON msg(ts)")
+
 def init_db():
+    """
+    - 테이블 없으면 신 스키마로 생성
+    - 과거 구스키마(uid 기반)도 허용(읽기/쓰기 로직에서 분기)
+    """
     with _conn() as c:
         if not _table_exists(c, "msg"):
-            # 새 스키마(id AUTOINCREMENT)
-            c.execute("""
-                CREATE TABLE msg (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    frm TEXT,
-                    rcpt TEXT,
-                    subj TEXT,
-                    dt TEXT,
-                    text TEXT,
-                    html TEXT,
-                    atts TEXT,
-                    ts INTEGER
-                )
-            """)
+            _ensure_new_schema(c)
             c.commit()
-        # kv 테이블은 필요 없지만, 과거 코드 호환을 위해 생성해두어도 무해
+        else:
+            # 기존 테이블이 있으면 인덱스만 보장
+            try:
+                _ensure_new_schema(c)
+                c.commit()
+            except Exception:
+                # 구스키마(uid 기반)일 수도 있으므로 조용히 통과
+                pass
+        # 과거 호환용 kv 테이블(사용 안 해도 무해)
         c.execute("""CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)""")
         c.commit()
 
@@ -43,10 +73,16 @@ def _is_old_uid_schema(c) -> bool:
     return ("uid" in cols) and ("frm" in cols) and ("subj" in cols)
 
 def save_messages(msgs: List[Dict]):
+    """
+    msgs = [{
+      "from": str, "to": str, "subject": str, "date": str,
+      "text": str, "html": Optional[str], "attachments": list[{"filename","content_b64"}]
+    }]
+    """
     now = int(time.time())
     with _conn() as c:
         if _is_old_uid_schema(c):
-            # 구(UID 기반) 스키마에 맞춰 저장
+            # 구(UID 기반) 스키마 저장 경로
             for i, m in enumerate(msgs):
                 uid = m.get("uid")
                 if uid is None:
@@ -65,10 +101,10 @@ def save_messages(msgs: List[Dict]):
         else:
             # 신 스키마(id AUTOINCREMENT)
             for m in msgs:
-                frm = m.get("from", "")
+                frm  = m.get("from", "")
                 rcpt = m.get("to", "")
                 subj = m.get("subject", "")
-                dt = m.get("date", "")
+                dt   = m.get("date", "")
                 text = m.get("text", "")
                 html = m.get("html")
                 atts = json.dumps(m.get("attachments") or [])
@@ -79,6 +115,12 @@ def save_messages(msgs: List[Dict]):
             c.commit()
 
 def list_messages_since(since_id: Optional[int], limit: int = 20):
+    """
+    since_id가 주어지면 그 이후(id > since_id)만, 없으면 최신부터 limit개.
+    반환 포맷:
+      [{"id":int, "from":str, "to":str, "subject":str, "date":str, "text":str}, ...]
+    """
+    limit = max(1, min(int(limit or 20), 200))  # 과도한 요청 방지
     with _conn() as c:
         if _is_old_uid_schema(c):
             # 구 스키마는 uid를 정렬 기준으로 사용
@@ -93,7 +135,6 @@ def list_messages_since(since_id: Optional[int], limit: int = 20):
                     (limit,)
                 )
             rows = cur.fetchall()
-            # API 응답 포맷 통일
             return [
                 {"id": r[0], "from": r[1], "to": "", "subject": r[2], "date": r[3], "text": r[4]}
                 for r in rows
