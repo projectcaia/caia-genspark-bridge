@@ -39,14 +39,13 @@ def safe_trunc(s: str, n: int = 3000) -> str:
     s = s or ""
     return s if len(s) <= n else s[:n] + "\n...[truncated]"
 
-# 리플렉스 키워드(간단 규칙)
+# 리플렉스 키워드
 REFLEX_KEYS = [r"\bΔ?K200\b", r"\bCOVIX\b", r"\bKOSPI200_F\b", r"\bVIX\b"]
 
 def classify_email(frm: str, subject: str, text: str) -> str:
     s = (subject or "").lower()
     f = (frm or "").lower()
     t = (text or "")
-    # 우선순위: SENTINEL > REFLEX > ZENSPARK > OTHER
     if "sentinel" in s or "[sentinel]" in s:
         return "SENTINEL"
     if "[reflex]" in s or any(re.search(k, t, re.IGNORECASE) for k in REFLEX_KEYS):
@@ -69,7 +68,6 @@ def importance_score(tag: str, subject: str, text: str) -> float:
     return min(score, 1.0)
 
 def push_to_thread_and_maybe_run(tag: str, frm: str, to_rcpt: str, subject: str, text: str):
-    """스레드에 메시지 기록하고, AUTO_RUN이면 Run 실행."""
     if not (client and ASSISTANT_ID and THREAD_ID):
         return False, "OpenAI client/IDs missing"
     content = (
@@ -89,17 +87,17 @@ def push_to_thread_and_maybe_run(tag: str, frm: str, to_rcpt: str, subject: str,
             instructions="센티넬/리플렉스/젠스파크 메일이면 요약 및 전략 초안 생성"
         )
     return True, "ok"
-# === Caia / Assistants & Telegram (추가 끝) ===
+
+# === Caia / Assistants & Telegram 끝 ===
 
 APP = FastAPI(title="Caia Mail Bridge – SendGrid")
 
 # ── ENV
-SENDER_DEFAULT = os.getenv("SENDER_DEFAULT")           # 예: axel.nam@caia-agent.com
-INBOUND_TOKEN  = os.getenv("INBOUND_TOKEN")            # 예: 랜덤 토큰
-AUTH_TOKEN     = os.getenv("AUTH_TOKEN")               # 폰 자가진단용 보호 토큰
+SENDER_DEFAULT = os.getenv("SENDER_DEFAULT")
+INBOUND_TOKEN  = os.getenv("INBOUND_TOKEN")
+AUTH_TOKEN     = os.getenv("AUTH_TOKEN")
 
 def _guard(token: Optional[str]) -> bool:
-    # AUTH_TOKEN 설정 안 했으면 패스(개발용). 운영에선 반드시 넣자.
     return (AUTH_TOKEN is None) or (token == AUTH_TOKEN)
 
 # ── Schemas
@@ -110,7 +108,7 @@ class SendReq(BaseModel):
     html: Optional[str] = None
     cc: Optional[List[str]] = None
     bcc: Optional[List[str]] = None
-    attachments_b64: Optional[List[dict]] = None  # [{"filename":"a.txt","content_b64":"..."}]
+    attachments_b64: Optional[List[dict]] = None
 
 class NLReq(BaseModel):
     command: str
@@ -133,7 +131,7 @@ async def api_send(req: SendReq):
     )
     return {"ok": True}
 
-# ── 발신(Form + 첨부)
+# ── 발신(Form)
 @APP.post("/mail/send-form")
 async def api_send_form(
     to: str = Form(...),
@@ -166,21 +164,18 @@ async def api_nl(req: NLReq):
     if emails:
         to = list(set(to + emails))
 
-    # 느슨한 파싱
     m_subj = re.search(r'(?:제목|subject)\s*(?:은|:)?\s*([^\n,]+)', cmd, flags=re.IGNORECASE)
     if m_subj: subj = m_subj.group(1).strip().strip('"').strip("'")
     m_body = re.search(r'(?:내용|message|body)\s*(?:은|:)?\s*(.+)$', cmd, flags=re.IGNORECASE)
     if m_body: body = m_body.group(1).strip()
 
-    if not body:
-        # 제목 뒤 꼬리에서 추정
-        if subj and subj in cmd:
-            tail = cmd.split(subj, 1)[-1]
-            m2 = re.search(r'(?:내용|보내)\s*(?:은|를|:)?\s*(.+)$', tail)
-            if m2: body = m2.group(1).strip()
+    if not body and subj and subj in cmd:
+        tail = cmd.split(subj, 1)[-1]
+        m2 = re.search(r'(?:내용|보내)\s*(?:은|를|:)?\s*(.+)$', tail)
+        if m2: body = m2.group(1).strip()
 
     if not to:
-        return {"ok": False, "error": "받는사람 이메일이 필요해. 'to: user@example.com' 포함해줘."}
+        return {"ok": False, "error": "받는사람 이메일이 필요해."}
 
     subj = (subj or "").strip() or "(제목 없음)"
     body = (body or "").strip() or "(내용 없음)"
@@ -189,7 +184,7 @@ async def api_nl(req: NLReq):
     return {"ok": True, "to": to, "subject": subj}
 
 # ── 수신(Webhook: SendGrid Inbound Parse)
-@APP.post("/inbound/sen")   # ← 기존 "/mail/inbound" → "/inbound/sen" 으로 변경
+@APP.post("/inbound/sen")   # ✅ 최종 목적지 URL
 async def inbound_parse(request: Request, token: str):
     if INBOUND_TOKEN and token != INBOUND_TOKEN:
         raise HTTPException(401, "invalid token")
@@ -201,7 +196,6 @@ async def inbound_parse(request: Request, token: str):
     text    = (form.get("text", "") or "").strip() or "(내용 없음)"
     html    = form.get("html", None)
 
-    # 첨부
     attachments = []
     try:
         n = int(form.get("attachments", 0))
@@ -226,11 +220,9 @@ async def inbound_parse(request: Request, token: str):
         "attachments": attachments
     }])
 
-    # === Caia Gateway Hook ===
     try:
         tag = classify_email(frm, subject, text)
         imp = importance_score(tag, subject, text)
-
         ok, info = push_to_thread_and_maybe_run(tag, frm, to_rcpt, subject, text)
 
         if (tag in ALERT_CLASSES) or (imp >= ALERT_IMPORTANCE_MIN):
@@ -244,6 +236,3 @@ async def inbound_parse(request: Request, token: str):
         send_telegram(f"⚠️ Caia 게이트웨이 처리 실패: {e}")
 
     return {"ok": True}
-
-
-# ── SendGrid 목적지 URL이 /inbound/sen
