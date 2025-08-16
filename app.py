@@ -189,7 +189,7 @@ async def api_nl(req: NLReq):
     return {"ok": True, "to": to, "subject": subj}
 
 # ── 수신(Webhook: SendGrid Inbound Parse)
-@APP.post("/mail/inbound")
+@APP.post("/inbound/sen")   # ← 기존 "/mail/inbound" → "/inbound/sen" 으로 변경
 async def inbound_parse(request: Request, token: str):
     if INBOUND_TOKEN and token != INBOUND_TOKEN:
         raise HTTPException(401, "invalid token")
@@ -226,7 +226,7 @@ async def inbound_parse(request: Request, token: str):
         "attachments": attachments
     }])
 
-    # === Caia Gateway Hook: 분류 → 스레드 기록 → (옵션) Run → (옵션) 텔레그램 알림 ===
+    # === Caia Gateway Hook ===
     try:
         tag = classify_email(frm, subject, text)
         imp = importance_score(tag, subject, text)
@@ -241,9 +241,9 @@ async def inbound_parse(request: Request, token: str):
                 f"→ 스레드 기록{' 및 판단 실행' if AUTO_RUN else ''}"
             )
     except Exception as e:
-        # Inbound 비활성화 방지: 실패는 알리고 200은 유지
         send_telegram(f"⚠️ Caia 게이트웨이 처리 실패: {e}")
 
     return {"ok": True}
+
 
 # ── SendGrid 목적지 URL이 /inbound/sen
