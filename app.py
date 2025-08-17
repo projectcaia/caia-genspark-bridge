@@ -1,4 +1,4 @@
-# app.py
+# app.py (FULL REPLACEMENT)
 import os
 import io
 import json
@@ -8,7 +8,7 @@ import datetime as dt
 from typing import List, Optional
 
 from fastapi import FastAPI, Request, UploadFile, Form, File, Query, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, EmailStr
 import requests
 
@@ -122,7 +122,6 @@ def assistants_log_and_maybe_run(sender: str, recipients: str, subject: str, tex
     if not (client and THREAD_ID):
         return {"thread_message_id": None, "run_id": None}
     content_text = f"From: {sender}\nTo: {recipients}\nSubject: {subject}\n\n{text or ''}"
-    # 메시지 기록
     msg = client.beta.threads.messages.create(
         thread_id=THREAD_ID,
         role="user",
@@ -147,6 +146,13 @@ class SendMailPayload(BaseModel):
     cc: Optional[List[EmailStr]] = None
     bcc: Optional[List[EmailStr]] = None
     attachments_b64: Optional[List[dict]] = None  # [{filename, content_b64, content_type?}]
+
+class ToolSendReq(BaseModel):
+    """툴에서 쓰기 쉬운 최소 필드 모델"""
+    to: List[EmailStr]
+    subject: str
+    text: str
+    html: Optional[str] = None
 
 # === Routes ===
 @app.get("/ping")
@@ -231,7 +237,6 @@ def inbox_json(limit: int = 10, token: Optional[str] = Query(None), request: Req
         FROM messages ORDER BY id DESC LIMIT ?
     """, (limit,)).fetchall()
     conn.close()
-    # 응답 키는 'messages'로 반환 (툴 스키마와 일치)
     return {"ok": True, "messages": [
         {
             "id": r["id"],
@@ -254,7 +259,6 @@ def mail_view(id: int = Query(...), token: Optional[str] = Query(None), request:
         raise HTTPException(status_code=404, detail="not found")
     data = dict(row)
     data["attachments"] = json.loads(data.pop("attachments_json") or "[]")
-    # 스키마에 맞춰 래핑
     return {"ok": True, "message": {
         "id": data["id"],
         "from": data["sender"],
@@ -318,20 +322,25 @@ def mail_send(payload: SendMailPayload, token: Optional[str] = Query(None), requ
         message.attachment = att_objs
 
     resp = sg.send(message)
-    # SendGrid는 보통 202 Accepted
     return {"ok": True, "status_code": getattr(resp, "status_code", None)}
 
-# (선택) 툴 친화 간단 발신 엔드포인트
+# === 툴 친화 간단 발신 (스키마 properties 포함용) ===
 @app.post("/tool/send")
-def tool_send(payload: dict, token: Optional[str] = Query(None), request: Request = None):
+def tool_send(payload: ToolSendReq, token: Optional[str] = Query(None), request: Request = None):
     """
-    payload: { "to": ["a@b.com"], "subject": "s", "text": "t", "html": null }
+    payload 예시:
+    {
+      "to": ["a@b.com"],
+      "subject": "s",
+      "text": "t",
+      "html": null
+    }
     """
     require_token(token, request)
-    model = SendMailPayload(**{
-        "to": payload.get("to", []),
-        "subject": payload.get("subject", ""),
-        "text": payload.get("text", ""),
-        "html": payload.get("html"),
-    })
+    model = SendMailPayload(
+        to=payload.to,
+        subject=payload.subject,
+        text=payload.text,
+        html=payload.html,
+    )
     return mail_send(model, token, request)
