@@ -1,11 +1,14 @@
 # app.py
-import os, base64, re, time, json
-from typing import List, Optional
+import os, base64, re, time, json, hashlib
+from typing import List, Optional, Dict
 from fastapi import FastAPI, UploadFile, File, Form, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 from mailer_sg import send_email_sg
-from store import init_db, save_messages, list_messages_since
+from store import (
+    init_db, save_messages, list_messages_since,
+    get_message_by_id, kv_get, kv_set
+)
 
 # === Caia / Assistants & Telegram ===
 import requests
@@ -20,14 +23,17 @@ TG_CHAT_ID     = os.getenv("TELEGRAM_CHAT_ID")
 AUTO_RUN = os.getenv("AUTO_RUN", "true").lower() == "true"
 ALERT_CLASSES = set([c.strip().upper() for c in os.getenv("ALERT_CLASSES", "SENTINEL,REFLEX,ZENSPARK").split(",") if c.strip()])
 ALERT_IMPORTANCE_MIN = float(os.getenv("ALERT_IMPORTANCE_MIN", "0.6"))
+DEDUPE_TTL_SEC = int(os.getenv("DEDUPE_TTL_SEC", "180"))  # 중복 방지 TTL
 
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 def send_telegram(text: str):
     if not (TG_TOKEN and TG_CHAT_ID): return
     try:
-        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                      json={"chat_id": TG_CHAT_ID, "text": text})
+        requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json={"chat_id": TG_CHAT_ID, "text": text}
+        )
     except Exception:
         pass
 
@@ -35,6 +41,7 @@ def safe_trunc(s: str, n: int = 3000) -> str:
     s = s or ""
     return s if len(s) <= n else s[:n] + "\n...[truncated]"
 
+# === 간단 규칙(분류) ===
 REFLEX_KEYS = [r"\bΔ?K200\b", r"\bCOVIX\b", r"\bKOSPI200_F\b", r"\bVIX\b"]
 
 def classify_email(frm: str, subject: str, text: str) -> str:
@@ -58,23 +65,54 @@ def importance_score(tag: str, subject: str, text: str) -> float:
         if kw in s or kw in t: score += 0.1
     return min(score, 1.0)
 
+# === 중복 방지 ===
+def make_fp(frm: str, to_rcpt: str, subject: str, text: str) -> str:
+    base = f"{(frm or '').lower()}|{(to_rcpt or '').lower()}|{(subject or '').strip()}|{(text or '')[:200]}"
+    return hashlib.sha256(base.encode("utf-8")).hexdigest()
+
+def seen_recent(fp: str) -> bool:
+    try:
+        v = kv_get(f"mailfp:{fp}")
+        if not v: return False
+        last_ts = int(v)
+        return (int(time.time()) - last_ts) < DEDUPE_TTL_SEC
+    except Exception:
+        return False
+
+def mark_seen(fp: str):
+    try:
+        kv_set(f"mailfp:{fp}", str(int(time.time())))
+    except Exception:
+        pass
+
 def push_to_thread_and_maybe_run(tag: str, frm: str, to_rcpt: str, subject: str, text: str):
     if not (client and ASSISTANT_ID and THREAD_ID):
         return False, "OpenAI client/IDs missing"
-    content = (f"[{tag}] inbound mail\nFrom: {frm}\nTo: {to_rcpt}\nSubject: {subject}\n\n{safe_trunc(text)}")
-    client.beta.threads.messages.create(thread_id=THREAD_ID, role="user", content=content)
+    content = (
+        f"[{tag}] inbound mail\n"
+        f"From: {frm}\nTo: {to_rcpt}\nSubject: {subject}\n\n"
+        f"{safe_trunc(text)}"
+    )
+    client.beta.threads.messages.create(
+        thread_id=THREAD_ID,
+        role="user",
+        content=content
+    )
     if AUTO_RUN:
-        client.beta.threads.runs.create(thread_id=THREAD_ID, assistant_id=ASSISTANT_ID,
-                                        instructions="센티넬/리플렉스/젠스파크 메일이면 요약 및 전략 초안 생성")
+        client.beta.threads.runs.create(
+            thread_id=THREAD_ID,
+            assistant_id=ASSISTANT_ID,
+            instructions="센티넬/리플렉스/젠스파크 메일이면 요약 및 전략 초안 생성"
+        )
     return True, "ok"
-# === 끝 ===
 
+# === FastAPI ===
 APP = FastAPI(title="Caia Mail Bridge – SendGrid")
 
 # ── ENV
 SENDER_DEFAULT = os.getenv("SENDER_DEFAULT")
 INBOUND_TOKEN  = os.getenv("INBOUND_TOKEN")
-AUTH_TOKEN     = os.getenv("AUTH_TOKEN")  # /status, /inbox 보호용
+AUTH_TOKEN     = os.getenv("AUTH_TOKEN")  # /status, /inbox, /mail/* 보호용
 
 def _guard(token: Optional[str]) -> bool:
     return (AUTH_TOKEN is None) or (token == AUTH_TOKEN)
@@ -88,6 +126,12 @@ class SendReq(BaseModel):
     cc: Optional[List[str]] = None
     bcc: Optional[List[str]] = None
     attachments_b64: Optional[List[dict]] = None
+    reply_to: Optional[str] = None
+    headers: Optional[Dict[str, str]] = None
+    categories: Optional[List[str]] = None
+    sandbox: bool = False
+    track_opens: bool = False
+    track_clicks: bool = False
 
 class NLReq(BaseModel):
     command: str
@@ -97,7 +141,6 @@ class NLReq(BaseModel):
 @APP.on_event("startup")
 def on_startup():
     init_db()
-    # 로드된 라우트 로그(디버그용)
     try:
         import logging
         routes = ", ".join(sorted([getattr(r, "path", str(r)) for r in APP.router.routes]))
@@ -130,9 +173,13 @@ def status(token: Optional[str] = None):
 async def api_send(req: SendReq):
     subject = (req.subject or "").strip() or "(제목 없음)"
     text    = (req.text or "").strip() or "(내용 없음)"
-    await send_email_sg(mail_from=SENDER_DEFAULT, to=req.to, subject=subject,
-                        text=text, html=req.html, cc=req.cc, bcc=req.bcc,
-                        attachments_b64=req.attachments_b64)
+    await send_email_sg(
+        mail_from=SENDER_DEFAULT,
+        to=req.to, subject=subject, text=text, html=req.html,
+        cc=req.cc, bcc=req.bcc, attachments_b64=req.attachments_b64,
+        reply_to=req.reply_to, headers=req.headers, categories=req.categories,
+        sandbox=req.sandbox, track_opens=req.track_opens, track_clicks=req.track_clicks
+    )
     return {"ok": True}
 
 # ── 발신(Form)
@@ -147,9 +194,11 @@ async def api_send_form(
     for f in files:
         b = await f.read()
         atts.append({"filename": f.filename, "content_b64": base64.b64encode(b).decode()})
-    await send_email_sg(mail_from=SENDER_DEFAULT,
-                        to=[x.strip() for x in to.split(",") if x.strip()],
-                        subject=subject, text=text, html=html, attachments_b64=atts)
+    await send_email_sg(
+        mail_from=SENDER_DEFAULT,
+        to=[x.strip() for x in to.split(",") if x.strip()],
+        subject=subject, text=text, html=html, attachments_b64=atts
+    )
     return {"ok": True}
 
 # ── 자연어 → 발신(JSON)
@@ -158,17 +207,26 @@ async def api_nl(req: NLReq):
     to = req.default_to or []
     cmd = (req.command or "").strip()
     subj = None; body = None
+
     emails = re.findall(r'[\w\.-]+@[\w\.-]+\.\w+', cmd)
     if emails: to = list(set(to + emails))
-    m_subj = re.search(r'(?:제목|subject)\\s*(?:은|:)?\\s*([^\\n,]+)', cmd, flags=re.IGNORECASE)
+
+    m_subj = re.search(r'(?:제목|subject)\s*(?:은|:)?\s*([^\n,]+)', cmd, flags=re.IGNORECASE)
     if m_subj: subj = m_subj.group(1).strip().strip('"').strip("'")
-    m_body = re.search(r'(?:내용|message|body)\\s*(?:은|:)?\\s*(.+)$', cmd, flags=re.IGNORECASE)
+    m_body = re.search(r'(?:내용|message|body)\s*(?:은|:)?\s*(.+)$', cmd, flags=re.IGNORECASE)
     if m_body: body = m_body.group(1).strip()
+
     if not body and subj and subj in cmd:
-        tail = cmd.split(subj, 1)[-1]; m2 = re.search(r'(?:내용|보내)\\s*(?:은|를|:)?\\s*(.+)$', tail)
+        tail = cmd.split(subj, 1)[-1]
+        m2 = re.search(r'(?:내용|보내)\s*(?:은|를|:)?\s*(.+)$', tail)
         if m2: body = m2.group(1).strip()
-    if not to: return {"ok": False, "error": "받는사람 이메일이 필요해."}
-    subj = (subj or "").strip() or "(제목 없음)"; body = (body or "").strip() or "(내용 없음)"
+
+    if not to:
+        return {"ok": False, "error": "받는사람 이메일이 필요해."}
+
+    subj = (subj or "").strip() or "(제목 없음)"
+    body = (body or "").strip() or "(내용 없음)"
+
     await send_email_sg(mail_from=SENDER_DEFAULT, to=to, subject=subj, text=body)
     return {"ok": True, "to": to, "subject": subj}
 
@@ -181,7 +239,7 @@ async def inbound_parse(request: Request, token: str):
     SendGrid Inbound Parse 웹훅 엔드포인트.
     - token 쿼리스트링으로 간단 인증
     - multipart/form-data / application/x-www-form-urlencoded 모두 처리
-    - DB 저장 → 분류/중요도 → 스레드 전달(+AUTO_RUN) → (조건)텔레그램 알림
+    - DB 저장 → (중복 차단) → 분류/중요도 → 스레드 전달(+AUTO_RUN) → (조건)텔레그램 알림
     """
     # 1) 토큰 검증
     if INBOUND_TOKEN and token != INBOUND_TOKEN:
@@ -191,7 +249,6 @@ async def inbound_parse(request: Request, token: str):
     try:
         form = await request.form()
     except Exception:
-        # 일부 케이스에서 form() 파싱 실패시 urlencoded 대비
         raw = await request.body()
         try:
             from urllib.parse import parse_qs
@@ -222,14 +279,20 @@ async def inbound_parse(request: Request, token: str):
 
     # 4) 저장
     save_messages([{
-        "from": frm,
-        "to": to_rcpt,
-        "subject": subject,
+        "from": frm, "to": to_rcpt, "subject": subject,
         "date": time.strftime("%a, %d %b %Y %H:%M:%S %z"),
-        "text": text,
-        "html": html,
-        "attachments": attachments
+        "text": text, "html": html, "attachments": attachments
     }])
+
+    # 4.5) 중복 차단
+    try:
+        fp = make_fp(frm, to_rcpt, subject, text)
+        if seen_recent(fp):
+            send_telegram(f"ℹ️ 중복 감지: '{subject}' (최근 {DEDUPE_TTL_SEC}s)")
+            return {"ok": True}
+        mark_seen(fp)
+    except Exception:
+        pass
 
     # 5) 게이트웨이: 분류 → 스레드 기록 → (옵션)Run → (옵션)텔레그램
     try:
@@ -246,7 +309,7 @@ async def inbound_parse(request: Request, token: str):
                 f"→ 스레드 기록{' 및 판단 실행' if AUTO_RUN else ''}"
             )
     except Exception as e:
-        # 인바운드 훅은 200을 유지해야 SendGrid 재시도폭격을 막을 수 있음
+        # 인바운드 훅은 200을 유지해야 SendGrid 재시도폭격을 막음
         send_telegram(f"⚠️ Caia 게이트웨이 처리 실패: {e}")
 
     return {"ok": True}
@@ -256,6 +319,92 @@ async def inbound_parse(request: Request, token: str):
 async def inbound_alias(request: Request, token: str):
     return await inbound_parse(request, token)
 
+# === 단건 조회/요약/포워드 ===
+
+@APP.get("/mail/view")
+def mail_view(id: int, token: Optional[str] = None):
+    """단건 조회(본문/HTML/첨부). AUTH 보호."""
+    if not _guard(token):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    msg = get_message_by_id(id)
+    if not msg:
+        return JSONResponse({"ok": False, "error": "not_found"}, status_code=404)
+    return {"ok": True, "message": msg}
+
+class ForwardReq(BaseModel):
+    to: List[str]
+    subject: Optional[str] = None
+    prepend_text: Optional[str] = None  # 원문 앞에 붙일 안내문 (선택)
+    token: Optional[str] = None
+
+@APP.post("/mail/forward")
+async def mail_forward(req: ForwardReq, id: int):
+    """저장된 첨부까지 포함해 재발송(포워드). token은 body로 받음."""
+    if not _guard(req.token):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    msg = get_message_by_id(id)
+    if not msg:
+        return JSONResponse({"ok": False, "error": "not_found"}, status_code=404)
+
+    subj = (req.subject or msg["subject"] or "(제목 없음)").strip()
+    body = (req.prepend_text or "") + "\n\n" + (msg.get("text") or "")
+    atts = msg.get("attachments") or []
+
+    await send_email_sg(
+        mail_from=SENDER_DEFAULT,
+        to=req.to, subject=subj, text=body,
+        html=msg.get("html"), attachments_b64=atts
+    )
+    return {"ok": True, "to": req.to, "subject": subj, "forwarded_id": id}
+
+class SummReq(BaseModel):
+    id: int
+    push_to_thread: bool = True
+    token: Optional[str] = None
+
+@APP.post("/mail/summarize")
+def mail_summarize(req: SummReq):
+    """본문 요약(OpenAI). AUTH 보호. (옵션) 스레드 기록."""
+    if not _guard(req.token):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    if not client:
+        return JSONResponse({"ok": False, "error": "openai_not_configured"}, status_code=500)
+
+    msg = get_message_by_id(req.id)
+    if not msg:
+        return JSONResponse({"ok": False, "error": "not_found"}, status_code=404)
+
+    text = msg.get("text") or ""
+    subject = msg.get("subject") or ""
+
+    # 간단 요약 프롬프트
+    prompt = (
+        "다음 메일의 핵심을 5줄 이내로 한국어 요약해줘. "
+        "핵심 시그널/숫자/액션 아이템을 남겨라.\n\n"
+        f"제목: {subject}\n본문:\n{text}"
+    )
+
+    # Assistants로 넣을 수도 있지만 여기선 단순 Chat Completions 대체(Assistants 메시지로도 가능)
+    # 최신 SDK에서는 responses/create 사용 가능하지만, v2 threads만 이미 쓰므로 간단히 메시지로 기록
+    summary = None
+    try:
+        # 메시지 생성 후 Run으로 요약까지 맡기고 싶다면 아래처럼:
+        client.beta.threads.messages.create(
+            thread_id=THREAD_ID,
+            role="user",
+            content=f"[SUM_REQ] summarize this mail (id={req.id})\n\n{prompt}"
+        )
+        if req.push_to_thread and AUTO_RUN:
+            client.beta.threads.runs.create(
+                thread_id=THREAD_ID,
+                assistant_id=ASSISTANT_ID,
+                instructions="위 SUM_REQ를 간결 요약으로 답하라."
+            )
+        summary = "(요약은 스레드에서 생성/조회하세요)"
+    except Exception as e:
+        summary = f"(로컬 요약 실패: {e})"
+
+    return {"ok": True, "id": req.id, "summary": summary}
 
 # ── 최근 수신(HTML/JSON)
 @APP.get("/inbox", response_class=HTMLResponse)
@@ -264,7 +413,9 @@ def inbox(limit: int = 10, token: Optional[str] = None):
         return HTMLResponse("<h3>401 Unauthorized</h3>", status_code=401)
     rows = list_messages_since(None, limit)
     rows_html = "".join([
-        f"<li><b>{r.get('subject','')}</b><br/>From: {r.get('from','')}<br/>To: {r.get('to','')}<br/>"
+        f"<li><b>{r.get('subject','')}</b>"
+        f" <small>{'[첨부]' if r.get('has_attachments') else ''}</small><br/>"
+        f"From: {r.get('from','')}<br/>To: {r.get('to','')}<br/>"
         f"<pre style='white-space:pre-wrap'>{(r.get('text','') or '')[:1000]}</pre><hr/></li>"
         for r in rows
     ]) or "<li>(수신 없음)</li>"
