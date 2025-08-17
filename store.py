@@ -1,5 +1,5 @@
 # store.py
-import sqlite3, os, time, json
+import sqlite3, os, time, json, hashlib
 from typing import List, Dict, Optional
 
 DB_PATH = os.getenv("DB_PATH", "mailbridge.sqlite3")
@@ -39,12 +39,31 @@ def _ensure_new_schema(c):
                 text TEXT,
                 html TEXT,
                 atts TEXT,
-                ts   INTEGER
+                ts   INTEGER,
+                hash TEXT
             )
         """)
     # 인덱스(존재하면 무시)
-    c.execute("CREATE INDEX IF NOT EXISTS idx_msg_id ON msg(id)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_msg_ts ON msg(ts)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_msg_id  ON msg(id)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_msg_ts  ON msg(ts)")
+    # 디듀프용 유니크 인덱스 (이미 있으면 무시)
+    try:
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_msg_hash ON msg(hash)")
+    except Exception:
+        pass
+
+def _ensure_hash_column(c):
+    """기존 신 스키마에 hash 컬럼이 없다면 추가 + 유니크 인덱스 생성."""
+    cols = _get_msg_columns(c)
+    if "hash" not in cols:
+        try:
+            c.execute("ALTER TABLE msg ADD COLUMN hash TEXT")
+        except Exception:
+            pass
+    try:
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_msg_hash ON msg(hash)")
+    except Exception:
+        pass
 
 def init_db():
     """
@@ -57,9 +76,10 @@ def init_db():
             _ensure_new_schema(c)
             c.commit()
         else:
-            # 기존 테이블이 있으면 인덱스만 보장
+            # 기존 테이블이 있으면 인덱스/해시 컬럼만 보장
             try:
                 _ensure_new_schema(c)
+                _ensure_hash_column(c)
                 c.commit()
             except Exception:
                 # 구스키마(uid 기반)일 수도 있으므로 조용히 통과
@@ -72,12 +92,18 @@ def _is_old_uid_schema(c) -> bool:
     # 옛 스키마: uid, frm, subj, dt, text, html, ts
     return ("uid" in cols) and ("frm" in cols) and ("subj" in cols)
 
+def _make_hash(frm: str, rcpt: str, subj: str, text: str) -> str:
+    base = f"{frm}|{rcpt}|{subj}|{text}"
+    return hashlib.sha256(base.encode("utf-8", "ignore")).hexdigest()
+
 def save_messages(msgs: List[Dict]):
     """
     msgs = [{
       "from": str, "to": str, "subject": str, "date": str,
       "text": str, "html": Optional[str], "attachments": list[{"filename","content_b64"}]
     }]
+    - 신 스키마: hash 기반 디듀프(UNIQUE)로 중복 저장 방지
+    - 구 스키마: 기존 로직 유지
     """
     now = int(time.time())
     with _conn() as c:
@@ -99,18 +125,19 @@ def save_messages(msgs: List[Dict]):
                 )
             c.commit()
         else:
-            # 신 스키마(id AUTOINCREMENT)
+            # 신 스키마(id AUTOINCREMENT) + 디듀프
             for m in msgs:
-                frm  = m.get("from", "")
-                rcpt = m.get("to", "")
-                subj = m.get("subject", "")
-                dt   = m.get("date", "")
-                text = m.get("text", "")
+                frm  = (m.get("from") or "").strip()
+                rcpt = (m.get("to") or "").strip()
+                subj = (m.get("subject") or "").strip()
+                dt   = (m.get("date") or "").strip()
+                text = (m.get("text") or "").strip()
                 html = m.get("html")
                 atts = json.dumps(m.get("attachments") or [])
+                hval = _make_hash(frm, rcpt, subj, text)
                 c.execute(
-                    "INSERT INTO msg(frm, rcpt, subj, dt, text, html, atts, ts) VALUES(?,?,?,?,?,?,?,?)",
-                    (frm, rcpt, subj, dt, text, html, atts, now)
+                    "INSERT OR IGNORE INTO msg(frm, rcpt, subj, dt, text, html, atts, ts, hash) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (frm, rcpt, subj, dt, text, html, atts, now, hval)
                 )
             c.commit()
 
