@@ -322,7 +322,11 @@ def mail_send(payload: SendMailPayload, token: Optional[str] = Query(None), requ
         message.attachment = att_objs
 
     resp = sg.send(message)
-    return {"ok": True, "status_code": getattr(resp, "status_code", None)}
+    return {
+        "ok": True,
+        "message": "메일이 성공적으로 발송되었습니다.",
+        "status_code": getattr(resp, "status_code", None)
+    }
 
 # === 툴 친화 간단 발신 (스키마 properties 포함용) ===
 @app.post("/tool/send")
@@ -343,4 +347,8 @@ def tool_send(payload: ToolSendReq, token: Optional[str] = Query(None), request:
         text=payload.text,
         html=payload.html,
     )
-    return mail_send(model, token, request)
+    # mail_send의 표준 응답 그대로 전달
+    res = mail_send(model, token, request)
+    # 혹시라도 상위 UI에서 별도 메시지를 기대하면 아래처럼 보강 가능:
+    # res.update({"tool_hint": "tool/send executed"})
+    return res
