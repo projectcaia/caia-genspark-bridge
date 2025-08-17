@@ -1,58 +1,51 @@
-# app.py
-# app.py 상단 import 라인에 추가
-from fastapi import Query
-from fastapi.responses import StreamingResponse
-from store import init_db, save_messages, list_messages_since, get_message_by_id  # ← get_message_by_id 추가
-import io, base64
 import os, re, time, json, base64, requests
-from typing import List, Optional
-from fastapi import FastAPI, UploadFile, File, Form, Request, HTTPException, Response
+from typing import List, Optional, Dict
+
+from fastapi import FastAPI, UploadFile, File, Form, Request, HTTPException, Response, Header
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from mailer_sg import send_email_sg
-from store import init_db, save_messages, list_messages_since, get_message_by_id  # ← 추가
+from store import init_db, save_messages, list_messages_since, get_message_by_id
 
 # ====== App ======
-app = FastAPI(title="Caia Mail Bridge – SendGrid")
+app = FastAPI(title="Caia Mail Bridge – SendGrid", version="1.2.0")
 
 # ====== ENV ======
 SENDER_DEFAULT = os.getenv("SENDER_DEFAULT")           # 예: caia@caia-agent.com
 INBOUND_TOKEN  = os.getenv("INBOUND_TOKEN")            # 예: 랜덤 토큰
-AUTH_TOKEN     = os.getenv("AUTH_TOKEN")               # /status, /inbox 보호 토큰
+AUTH_TOKEN     = os.getenv("AUTH_TOKEN")               # /status, /inbox 등 보호 토큰
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ASSISTANT_ID   = os.getenv("ASSISTANT_ID")
 THREAD_ID      = os.getenv("THREAD_ID")
 
-TG_TOKEN       = os.getenv("TELEGRAM_BOT_TOKEN")
-TG_CHAT_ID     = os.getenv("TELEGRAM_CHAT_ID")
-
 AUTO_RUN = os.getenv("AUTO_RUN", "true").lower() == "true"
 ALERT_CLASSES = set([c.strip().upper() for c in os.getenv("ALERT_CLASSES", "SENTINEL,REFLEX,ZENSPARK").split(",") if c.strip()])
 ALERT_IMPORTANCE_MIN = float(os.getenv("ALERT_IMPORTANCE_MIN", "0.6"))
 
-# OpenAI client (assistants v2)
+# (선택) OpenAI Assistants v2
 try:
     from openai import OpenAI
     client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 except Exception:
     client = None
 
-# ====== Utils ======
-def _guard(token: Optional[str]) -> bool:
-    return (AUTH_TOKEN is None) or (token == AUTH_TOKEN)
 
-def send_telegram(text: str):
-    if not (TG_TOKEN and TG_CHAT_ID):
-        return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT_ID, "text": text}
-        )
-    except Exception:
-        pass
+# ====== 공용 유틸 ======
+def _authorized(token_qs: Optional[str], auth_header: Optional[str]) -> bool:
+    """
+    두 방식 모두 허용:
+      1) 쿼리스트링 ?token=AUTH_TOKEN
+      2) Authorization: Bearer AUTH_TOKEN
+    """
+    if AUTH_TOKEN is None:
+        return True
+    if token_qs == AUTH_TOKEN:
+        return True
+    if auth_header and auth_header.lower().startswith("bearer "):
+        return (auth_header.split(" ", 1)[1].strip() == AUTH_TOKEN)
+    return False
 
 def safe_trunc(s: str, n: int = 3000) -> str:
     s = s or ""
@@ -98,6 +91,7 @@ def push_to_thread_and_maybe_run(tag: str, frm: str, to_rcpt: str, subject: str,
         )
     return True, "ok"
 
+
 # ====== Schemas ======
 class SendReq(BaseModel):
     to: List[str]
@@ -112,34 +106,30 @@ class NLReq(BaseModel):
     command: str
     default_to: Optional[List[str]] = None
 
-# ====== Startup / Shutdown ======
+class ToolSendReq(BaseModel):
+    """툴용: 간단 발신형"""
+    to: List[str]
+    subject: str
+    text: str
+    html: Optional[str] = None
+
+
+# ====== Startup ======
 @app.on_event("startup")
 def on_startup():
     init_db()
-    try:
-        import logging
-        routes = ", ".join(sorted([getattr(r, "path", str(r)) for r in app.router.routes]))
-        logging.getLogger("uvicorn.error").info(f"[Caia] Routes: {routes}")
-    except Exception:
-        pass
-    send_telegram("🚀 Caia Mail Bridge 서버 시작됨.")
 
-@app.on_event("shutdown")
-def on_shutdown():
-    send_telegram("🛑 Caia Mail Bridge 서버 종료됨.")
 
 # ====== Health / Status ======
 @app.get("/ping")
-def ping():
-    return {"pong": True}
+def ping(): return {"pong": True}
 
 @app.get("/health")
-def health():
-    return {"ok": True, "sender": SENDER_DEFAULT}
+def health(): return {"ok": True, "sender": SENDER_DEFAULT}
 
 @app.get("/status", response_class=HTMLResponse)
-def status(token: Optional[str] = None):
-    if not _guard(token):
+def status(token: Optional[str] = None, authorization: Optional[str] = Header(None)):
+    if not _authorized(token, authorization):
         return HTMLResponse("<h3>401 Unauthorized</h3>", status_code=401)
     return HTMLResponse(f"""
     <html><body>
@@ -151,9 +141,12 @@ def status(token: Optional[str] = None):
       <p><a href="/inbox?limit=10&token={token or ''}">최근 수신 보기</a></p>
     </body></html>""")
 
+
 # ====== 발신 ======
 @app.post("/mail/send")
-async def api_send(req: SendReq):
+async def api_send(req: SendReq, token: Optional[str] = None, authorization: Optional[str] = Header(None)):
+    if not _authorized(token, authorization):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
     subject = (req.subject or "").strip() or "(제목 없음)"
     text    = (req.text or "").strip() or "(내용 없음)"
     await send_email_sg(
@@ -167,7 +160,10 @@ async def api_send(req: SendReq):
 async def api_send_form(
     to: str = Form(...), subject: str = Form(""), text: str = Form(""),
     html: str = Form(None), files: List[UploadFile] = File(default_factory=list),
+    token: Optional[str] = None, authorization: Optional[str] = Header(None)
 ):
+    if not _authorized(token, authorization):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
     subject = (subject or "").strip() or "(제목 없음)"
     text    = (text or "").strip() or "(내용 없음)"
     atts = []
@@ -181,8 +177,27 @@ async def api_send_form(
     )
     return {"ok": True}
 
+@app.post("/tool/send")
+async def tool_send(req: ToolSendReq, token: Optional[str] = None, authorization: Optional[str] = Header(None)):
+    """
+    GPT 툴에서 쓰기 좋은 단순 발신 엔드포인트
+    """
+    if not _authorized(token, authorization):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    subject = (req.subject or "").strip() or "(제목 없음)"
+    text    = (req.text or "").strip() or "(내용 없음)"
+    await send_email_sg(
+        mail_from=SENDER_DEFAULT, to=req.to, subject=subject, text=text, html=req.html
+    )
+    return {"ok": True}
+
+
+# ====== 자연어 → 발신(JSON) ======
 @app.post("/mail/nl")
-async def api_nl(req: NLReq):
+async def api_nl(req: NLReq, token: Optional[str] = None, authorization: Optional[str] = Header(None)):
+    if not _authorized(token, authorization):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+
     to = req.default_to or []
     cmd = (req.command or "").strip()
     subj = None; body = None
@@ -209,24 +224,26 @@ async def api_nl(req: NLReq):
     await send_email_sg(mail_from=SENDER_DEFAULT, to=to, subject=subj, text=body)
     return {"ok": True, "to": to, "subject": subj}
 
+
 # ====== 수신 (SendGrid Inbound Parse) ======
 @app.post("/inbound/sen")
 async def inbound_parse(request: Request, token: str):
     """
     SendGrid Inbound Parse 웹훅:
-    - token 인증 → 폼 파싱 → DB 저장 → 분류/중요도 → 스레드 기록(+AUTO_RUN) → (조건)텔레그램
+    - token 인증 → 폼 파싱 → DB 저장 → 분류/중요도 → 스레드 기록(+AUTO_RUN)
     """
     if INBOUND_TOKEN and token != INBOUND_TOKEN:
         raise HTTPException(401, "invalid token")
 
-    # multipart/form-data or x-www-form-urlencoded
+    # multipart/form-data 또는 x-www-form-urlencoded
     try:
         form = await request.form()
     except Exception:
         raw = await request.body()
         try:
             from urllib.parse import parse_qs
-            form = {k: v[0] if isinstance(v, list) else v for k, v in parse_qs(raw.decode("utf-8", "ignore")).items()}
+            form = {k: v[0] if isinstance(v, list) else v
+                    for k, v in parse_qs(raw.decode("utf-8", "ignore")).items()}
         except Exception:
             form = {}
 
@@ -236,7 +253,7 @@ async def inbound_parse(request: Request, token: str):
     text    = (form.get("text", "") or "").strip() or "(내용 없음)"
     html    = form.get("html", None)
 
-    # attachments
+    # 첨부
     attachments = []
     try:
         n = int(form.get("attachments", 0))
@@ -261,19 +278,13 @@ async def inbound_parse(request: Request, token: str):
         "attachments": attachments
     }])
 
+    # 게이트웨이: 분류 → 스레드 기록 → (옵션)Run
     try:
         tag = classify_email(frm, subject, text)
         imp = importance_score(tag, subject, text)
         push_to_thread_and_maybe_run(tag, frm, to_rcpt, subject, text)
-
-        if (tag in ALERT_CLASSES) or (imp >= ALERT_IMPORTANCE_MIN):
-            send_telegram(
-                f"📬 {tag} 메일 감지\n제목: {subject}\n보낸사람: {frm}\n중요도: {imp:.2f}\n"
-                f"→ 스레드 기록{' 및 판단 실행' if AUTO_RUN else ''}"
-            )
-    except Exception as e:
-        # 훅은 200 유지(재시도 폭주 방지)
-        send_telegram(f"⚠️ Caia 게이트웨이 처리 실패: {e}")
+    except Exception:
+        pass
 
     return {"ok": True}
 
@@ -282,10 +293,11 @@ async def inbound_parse(request: Request, token: str):
 async def inbound_alias(request: Request, token: str):
     return await inbound_parse(request, token)
 
+
 # ====== Inbox (list / view / attach) ======
 @app.get("/inbox", response_class=HTMLResponse)
-def inbox(limit: int = 10, token: Optional[str] = None):
-    if not _guard(token):
+def inbox(limit: int = 10, token: Optional[str] = None, authorization: Optional[str] = Header(None)):
+    if not _authorized(token, authorization):
         return HTMLResponse("<h3>401 Unauthorized</h3>", status_code=401)
     rows = list_messages_since(None, limit)
     rows_html = "".join([
@@ -298,27 +310,29 @@ def inbox(limit: int = 10, token: Optional[str] = None):
     return HTMLResponse(f"<html><body><h2>최근 수신 {limit}개</h2><ul>{rows_html}</ul></body></html>")
 
 @app.get("/inbox.json")
-def inbox_json(limit: int = 10, token: Optional[str] = None):
-    if not _guard(token):
+def inbox_json(limit: int = 10, token: Optional[str] = None, authorization: Optional[str] = Header(None)):
+    if not _authorized(token, authorization):
         return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
     rows = list_messages_since(None, limit)
     return {"ok": True, "messages": rows}
 
 @app.get("/mail/view")
-def mail_view(id: int, token: Optional[str] = None):
+def mail_view(id: int, token: Optional[str] = None, authorization: Optional[str] = Header(None)):
     """단건 조회: 본문/HTML/첨부(메타)까지 반환"""
-    if not _guard(token):
+    if not _authorized(token, authorization):
         return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
     msg = get_message_by_id(id)
     if not msg:
         return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
-    # content_b64는 그대로 전달(대용량 주의)
     return {"ok": True, "message": msg}
 
 @app.get("/mail/attach")
-def mail_attach(id: int, idx: int = 0, download: int = 1, token: Optional[str] = None):
+def mail_attach(
+    id: int, idx: int = 0, download: int = 1,
+    token: Optional[str] = None, authorization: Optional[str] = Header(None)
+):
     """첨부 다운로드: /mail/attach?id=123&idx=0&download=1"""
-    if not _guard(token):
+    if not _authorized(token, authorization):
         return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
     msg = get_message_by_id(id)
     if not msg:
