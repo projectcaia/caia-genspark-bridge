@@ -1,9 +1,11 @@
 # app.py
 import os, base64, re, time, json, hashlib
 from typing import List, Optional, Dict
+
 from fastapi import FastAPI, UploadFile, File, Form, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
+
 from mailer_sg import send_email_sg
 from store import (
     init_db, save_messages, list_messages_since,
@@ -23,7 +25,8 @@ TG_CHAT_ID     = os.getenv("TELEGRAM_CHAT_ID")
 AUTO_RUN = os.getenv("AUTO_RUN", "true").lower() == "true"
 ALERT_CLASSES = set([c.strip().upper() for c in os.getenv("ALERT_CLASSES", "SENTINEL,REFLEX,ZENSPARK").split(",") if c.strip()])
 ALERT_IMPORTANCE_MIN = float(os.getenv("ALERT_IMPORTANCE_MIN", "0.6"))
-DEDUPE_TTL_SEC = int(os.getenv("DEDUPE_TTL_SEC", "180"))  # 중복 방지 TTL
+DEDUPE_TTL_SEC = int(os.getenv("DEDUPE_TTL_SEC", "180"))   # 메일 중복 TTL(초)
+RUN_COOLDOWN_SEC = int(os.getenv("RUN_COOLDOWN_SEC", "45"))  # Run 쿨다운(초)
 
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
@@ -85,6 +88,21 @@ def mark_seen(fp: str):
     except Exception:
         pass
 
+# === Run 스로틀(쿨다운) ===
+def run_cooldown_active() -> bool:
+    try:
+        v = kv_get("run:last")
+        if not v: return False
+        return (int(time.time()) - int(v)) < RUN_COOLDOWN_SEC
+    except Exception:
+        return False
+
+def mark_run_fired():
+    try:
+        kv_set("run:last", str(int(time.time())))
+    except Exception:
+        pass
+
 def push_to_thread_and_maybe_run(tag: str, frm: str, to_rcpt: str, subject: str, text: str):
     if not (client and ASSISTANT_ID and THREAD_ID):
         return False, "OpenAI client/IDs missing"
@@ -98,12 +116,15 @@ def push_to_thread_and_maybe_run(tag: str, frm: str, to_rcpt: str, subject: str,
         role="user",
         content=content
     )
-    if AUTO_RUN:
+    # AUTO_RUN은 ALERT_CLASSES 내 태그이고, 쿨다운 중이 아닐 때만
+    should_autorun = AUTO_RUN and (tag.upper() in ALERT_CLASSES) and (not run_cooldown_active())
+    if should_autorun:
         client.beta.threads.runs.create(
             thread_id=THREAD_ID,
             assistant_id=ASSISTANT_ID,
             instructions="센티넬/리플렉스/젠스파크 메일이면 요약 및 전략 초안 생성"
         )
+        mark_run_fired()
     return True, "ok"
 
 # === FastAPI ===
@@ -231,13 +252,11 @@ async def api_nl(req: NLReq):
     return {"ok": True, "to": to, "subject": subj}
 
 # ── 수신(Webhook: SendGrid Inbound Parse)
-from fastapi import Body
-
 @APP.post("/inbound/sen")
 async def inbound_parse(request: Request, token: str):
     """
     SendGrid Inbound Parse 웹훅 엔드포인트.
-    - token 쿼리스트링으로 간단 인증
+    - token 쿼리스트링 인증
     - multipart/form-data / application/x-www-form-urlencoded 모두 처리
     - DB 저장 → (중복 차단) → 분류/중요도 → 스레드 전달(+AUTO_RUN) → (조건)텔레그램 알림
     """
@@ -299,7 +318,7 @@ async def inbound_parse(request: Request, token: str):
         tag = classify_email(frm, subject, text)
         imp = importance_score(tag, subject, text)
 
-        ok, _ = push_to_thread_and_maybe_run(tag, frm, to_rcpt, subject, text)
+        push_to_thread_and_maybe_run(tag, frm, to_rcpt, subject, text)
 
         if (tag in ALERT_CLASSES) or (imp >= ALERT_IMPORTANCE_MIN):
             send_telegram(
@@ -377,22 +396,15 @@ def mail_summarize(req: SummReq):
     text = msg.get("text") or ""
     subject = msg.get("subject") or ""
 
-    # 간단 요약 프롬프트
-    prompt = (
-        "다음 메일의 핵심을 5줄 이내로 한국어 요약해줘. "
-        "핵심 시그널/숫자/액션 아이템을 남겨라.\n\n"
-        f"제목: {subject}\n본문:\n{text}"
-    )
-
-    # Assistants로 넣을 수도 있지만 여기선 단순 Chat Completions 대체(Assistants 메시지로도 가능)
-    # 최신 SDK에서는 responses/create 사용 가능하지만, v2 threads만 이미 쓰므로 간단히 메시지로 기록
-    summary = None
+    # 스레드에 요약 요청 메시지 기록(Assistants가 처리)
     try:
-        # 메시지 생성 후 Run으로 요약까지 맡기고 싶다면 아래처럼:
         client.beta.threads.messages.create(
             thread_id=THREAD_ID,
             role="user",
-            content=f"[SUM_REQ] summarize this mail (id={req.id})\n\n{prompt}"
+            content=f"[SUM_REQ] summarize this mail (id={req.id})\n\n"
+                    f"다음 메일의 핵심을 5줄 이내로 한국어 요약해줘. "
+                    f"핵심 시그널/숫자/액션 아이템을 남겨라.\n\n"
+                    f"제목: {subject}\n본문:\n{text}"
         )
         if req.push_to_thread and AUTO_RUN:
             client.beta.threads.runs.create(
@@ -400,9 +412,9 @@ def mail_summarize(req: SummReq):
                 assistant_id=ASSISTANT_ID,
                 instructions="위 SUM_REQ를 간결 요약으로 답하라."
             )
-        summary = "(요약은 스레드에서 생성/조회하세요)"
+        summary = "(요약은 스레드 메시지로 생성됨)"
     except Exception as e:
-        summary = f"(로컬 요약 실패: {e})"
+        summary = f"(요약 요청 실패: {e})"
 
     return {"ok": True, "id": req.id, "summary": summary}
 
