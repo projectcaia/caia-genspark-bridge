@@ -1,4 +1,9 @@
 # app.py
+# app.py 상단 import 라인에 추가
+from fastapi import Query
+from fastapi.responses import StreamingResponse
+from store import init_db, save_messages, list_messages_since, get_message_by_id  # ← get_message_by_id 추가
+import io, base64
 import os, re, time, json, base64, requests
 from typing import List, Optional
 from fastapi import FastAPI, UploadFile, File, Form, Request, HTTPException, Response
