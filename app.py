@@ -1,12 +1,12 @@
 # app.py
 import os, re, time, json, base64, requests
-from typing import List, Optional, Dict
-from fastapi import FastAPI, UploadFile, File, Form, Request, HTTPException
+from typing import List, Optional
+from fastapi import FastAPI, UploadFile, File, Form, Request, HTTPException, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from mailer_sg import send_email_sg
-from store import init_db, save_messages, list_messages_since
+from store import init_db, save_messages, list_messages_since, get_message_by_id  # ← 추가
 
 # ====== App ======
 app = FastAPI(title="Caia Mail Bridge – SendGrid")
@@ -39,7 +39,7 @@ def _guard(token: Optional[str]) -> bool:
     return (AUTH_TOKEN is None) or (token == AUTH_TOKEN)
 
 def send_telegram(text: str):
-    if not (TG_TOKEN and TG_CHAT_ID): 
+    if not (TG_TOKEN and TG_CHAT_ID):
         return
     try:
         requests.post(
@@ -76,7 +76,7 @@ def importance_score(tag: str, subject: str, text: str) -> float:
     if tag == "SENTINEL": score += 0.8
     if tag == "REFLEX":   score += 0.7
     if tag == "ZENSPARK": score += 0.5
-    for kw in ["급락","급등","panic","spike","alert","경보","임계"]:
+    for kw in ["급락", "급등", "panic", "spike", "alert", "경보", "임계"]:
         if kw in s or kw in t: score += 0.1
     return min(score, 1.0)
 
@@ -107,7 +107,7 @@ class NLReq(BaseModel):
     command: str
     default_to: Optional[List[str]] = None
 
-# ====== Startup ======
+# ====== Startup / Shutdown ======
 @app.on_event("startup")
 def on_startup():
     init_db()
@@ -121,15 +121,16 @@ def on_startup():
 
 @app.on_event("shutdown")
 def on_shutdown():
-    # 롤링배포 노이즈 줄이려면 여기 필터링 로직 추가 가능
     send_telegram("🛑 Caia Mail Bridge 서버 종료됨.")
 
 # ====== Health / Status ======
 @app.get("/ping")
-def ping(): return {"pong": True}
+def ping():
+    return {"pong": True}
 
 @app.get("/health")
-def health(): return {"ok": True, "sender": SENDER_DEFAULT}
+def health():
+    return {"ok": True, "sender": SENDER_DEFAULT}
 
 @app.get("/status", response_class=HTMLResponse)
 def status(token: Optional[str] = None):
@@ -266,16 +267,17 @@ async def inbound_parse(request: Request, token: str):
                 f"→ 스레드 기록{' 및 판단 실행' if AUTO_RUN else ''}"
             )
     except Exception as e:
+        # 훅은 200 유지(재시도 폭주 방지)
         send_telegram(f"⚠️ Caia 게이트웨이 처리 실패: {e}")
 
     return {"ok": True}
 
-# 호환용 alias (콘솔에 /inbound/sendgrid 로 잡아둔 경우)
+# 콘솔에 /inbound/sendgrid 로 잡아둔 경우 호환용
 @app.post("/inbound/sendgrid")
 async def inbound_alias(request: Request, token: str):
     return await inbound_parse(request, token)
 
-# ====== Inbox (view) ======
+# ====== Inbox (list / view / attach) ======
 @app.get("/inbox", response_class=HTMLResponse)
 def inbox(limit: int = 10, token: Optional[str] = None):
     if not _guard(token):
@@ -283,7 +285,9 @@ def inbox(limit: int = 10, token: Optional[str] = None):
     rows = list_messages_since(None, limit)
     rows_html = "".join([
         f"<li><b>{r.get('subject','')}</b><br/>From: {r.get('from','')}<br/>To: {r.get('to','')}<br/>"
-        f"<pre style='white-space:pre-wrap'>{(r.get('text','') or '')[:1000]}</pre><hr/></li>"
+        f"<pre style='white-space:pre-wrap'>{(r.get('text','') or '')[:1000]}</pre>"
+        f"<div>첨부: {'있음' if r.get('has_attachments') else '없음'} "
+        f"(보기: /mail/view?id={r.get('id')}&token={token or ''})</div><hr/></li>"
         for r in rows
     ]) or "<li>(수신 없음)</li>"
     return HTMLResponse(f"<html><body><h2>최근 수신 {limit}개</h2><ul>{rows_html}</ul></body></html>")
@@ -294,3 +298,37 @@ def inbox_json(limit: int = 10, token: Optional[str] = None):
         return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
     rows = list_messages_since(None, limit)
     return {"ok": True, "messages": rows}
+
+@app.get("/mail/view")
+def mail_view(id: int, token: Optional[str] = None):
+    """단건 조회: 본문/HTML/첨부(메타)까지 반환"""
+    if not _guard(token):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    msg = get_message_by_id(id)
+    if not msg:
+        return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
+    # content_b64는 그대로 전달(대용량 주의)
+    return {"ok": True, "message": msg}
+
+@app.get("/mail/attach")
+def mail_attach(id: int, idx: int = 0, download: int = 1, token: Optional[str] = None):
+    """첨부 다운로드: /mail/attach?id=123&idx=0&download=1"""
+    if not _guard(token):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    msg = get_message_by_id(id)
+    if not msg:
+        return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
+    atts = msg.get("attachments") or []
+    if not atts or idx < 0 or idx >= len(atts):
+        return JSONResponse({"ok": False, "error": "attachment not found"}, status_code=404)
+    att = atts[idx]
+    filename = att.get("filename") or f"attach-{idx}.bin"
+    b64 = att.get("content_b64") or ""
+    try:
+        raw = base64.b64decode(b64)
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid attachment"}, status_code=400)
+    headers = {}
+    if int(download or 0) == 1:
+        headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return Response(content=raw, media_type="application/octet-stream", headers=headers)
