@@ -12,6 +12,14 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, EmailStr
 import requests
 
+
+# --- i18n env helper (supports Korean aliases) ---
+def env_get(names, default=""):
+    for n in names:
+        v = os.getenv(n)
+        if v not in (None, ""):
+            return v
+    return default
 # --- Optional SDKs (환경변수 없으면 비활성) ---
 try:
     from openai import OpenAI  # pip openai>=1.40
@@ -46,6 +54,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 AUTO_RUN      = os.getenv("AUTO_RUN", "false").lower() == "true"
 ALERT_CLASSES = set([s.strip().upper() for s in os.getenv("ALERT_CLASSES","SENTINEL,REFLEX,ZENSPARK").split(",") if s.strip()])
+AUTO_NOTIFY_INBOUND = env_get(["AUTO_NOTIFY_INBOUND"], "true").lower() in ("1","true","yes")
 ALERT_IMPORTANCE_MIN = float(os.getenv("ALERT_IMPORTANCE_MIN", "0.6"))
 DB_PATH       = os.getenv("DB_PATH", "mailbridge.sqlite3")
 
@@ -226,6 +235,25 @@ async def inbound_sen(
 
     return {"ok": True, "id": msg_id, "assistant": res, "alert_class": aclass, "importance": importance}
 
+
+@app.post("/mail/inbox")
+def inbox_post(limit: int = 10, subject: Optional[str] = None, sender: Optional[str] = None, token: Optional[str] = Query(None), request: Request = None):
+    require_token(token, request)
+    limit = max(1, min(200, limit))
+    where = []
+    args = []
+    if subject:
+        where.append("subject LIKE ?")
+        args.append(f"%{subject}%")
+    if sender:
+        where.append("sender LIKE ?")
+        args.append(f"%{sender}%")
+    wh = ("WHERE " + " AND ".join(where)) if where else ""
+    conn = db()
+    rows = conn.execute(f"SELECT id, sender, recipients, subject, substr(text,1,400) AS text, created_at FROM messages {wh} ORDER BY id DESC LIMIT ?", (*args, limit)).fetchall()
+    conn.close()
+    return {"ok": True, "emails": [dict(r) for r in rows]}
+
 @app.get("/inbox.json")
 def inbox_json(limit: int = 10, token: Optional[str] = Query(None), request: Request = None):
     require_token(token, request)
@@ -352,3 +380,20 @@ def tool_send(payload: ToolSendReq, token: Optional[str] = Query(None), request:
     # 혹시라도 상위 UI에서 별도 메시지를 기대하면 아래처럼 보강 가능:
     # res.update({"tool_hint": "tool/send executed"})
     return res
+
+
+@app.post("/mail/digest")
+def inbox_digest(limit: int = 10, token: Optional[str] = Query(None), request: Request = None):
+    require_token(token, request)
+    limit = max(1, min(200, limit))
+    conn = db()
+    rows = conn.execute("SELECT id, sender, subject, substr(text,1,200) AS text, created_at FROM messages ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    conn.close()
+    if not rows:
+        telegram_notify("📭 최근 수신 메일 없음")
+        return {"ok": True, "lines": 0}
+    lines = [f"- [{r['created_at']}] {r['sender']} / {r['subject']} :: {r['text']}" for r in rows]
+    msg = "📬 최근 메일 요약\n" + "\n".join(lines)
+    telegram_notify(msg)
+    return {"ok": True, "lines": len(lines)}
+
