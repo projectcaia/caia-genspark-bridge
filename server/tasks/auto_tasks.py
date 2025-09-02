@@ -31,10 +31,14 @@ def auto_delete(ttl_days: int = 7):
     cutoff = datetime.utcnow() - timedelta(days=ttl_days)
     cur.execute("SELECT id, subject FROM mails WHERE deleted=0 AND priority='low' AND created_at < ?", (cutoff.isoformat(),))
     rows = cur.fetchall()
+    deleted_count = 0
     for row in rows:
         cur.execute("UPDATE mails SET deleted=1 WHERE id=?", (row["id"],))
-        notify_telegram("메일 자동삭제", f"메일 ID {row['id']} ({row['subject']}) 자동 삭제됨")
+        deleted_count += 1
     conn.commit()
+    # Only notify if bulk deletion
+    if deleted_count >= 50:
+        notify_telegram("대량 메일 삭제", f"{deleted_count}건의 메일이 자동 삭제되었습니다.")
 
 def auto_reply():
     conn = get_db()
@@ -42,6 +46,17 @@ def auto_reply():
     cur.execute("SELECT id, from_, subject FROM mails WHERE replied=0 AND auto_reply=1")
     rows = cur.fetchall()
     for row in rows:
-        notify_telegram("메일 자동답장", f"메일 ID {row['id']} ({row['subject']}) 자동 답장 보냄")
-        cur.execute("UPDATE mails SET replied=1 WHERE id=?", (row["id"],))
+        try:
+            # simulate reply send
+            cur.execute("UPDATE mails SET replied=1 WHERE id=?", (row["id"],))
+        except Exception as e:
+            notify_telegram("자동답장 실패", f"메일 ID {row['id']} ({row['subject']}) 답장 실패: {e}")
     conn.commit()
+
+def report_high_priority():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id, from_, subject FROM mails WHERE priority='high' AND deleted=0")
+    rows = cur.fetchall()
+    for row in rows:
+        notify_telegram("중요 메일 도착", f"{row['subject']} from {row['from_']} (ID {row['id']})")
