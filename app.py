@@ -140,9 +140,21 @@ def _bearer_from_header(request: Request) -> Optional[str]:
     return None
 
 def require_token(token_qs: Optional[str], request: Optional[Request] = None):
-    incoming = token_qs or (_bearer_from_header(request) if request else None)
-    if not AUTH_TOKEN or incoming != AUTH_TOKEN:
+    """Validate AUTH_TOKEN or INBOUND_TOKEN on protected endpoints."""
+    incoming = token_qs
+    if request:
+        # Allow token via Authorization Bearer or custom header
+        incoming = incoming or _bearer_from_header(request) or request.headers.get("X-Auth-Token")
+    if incoming not in {AUTH_TOKEN, INBOUND_TOKEN}:
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+def require_inbound_token(token_qs: Optional[str] = None, request: Optional[Request] = None):
+    """Strictly validate INBOUND_TOKEN for webhook/intake calls."""
+    incoming = token_qs
+    if request:
+        incoming = incoming or request.headers.get("X-Auth-Token") or _bearer_from_header(request)
+    if not INBOUND_TOKEN or incoming != INBOUND_TOKEN:
+        raise HTTPException(status_code=401, detail="invalid token")
 
 def simple_alert_parse(subject: Optional[str], text: Optional[str]):
     """간단 중요도/클래스 추정: [CLASS] 접두 + 키워드 가중"""
@@ -263,8 +275,7 @@ async def inbound_sen(
     attachments: Optional[List[UploadFile]] = File(None),
 ):
     # inbound token check
-    if not INBOUND_TOKEN or token != INBOUND_TOKEN:
-        raise HTTPException(status_code=401, detail="invalid token")
+    require_inbound_token(token, request)
 
     # serialize attachments
     atts = []
@@ -307,9 +318,7 @@ async def inbound_sen(
 
 @app.post("/webhook/mail")
 def webhook_mail(payload: WebhookMailPayload, request: Request):
-    token = request.headers.get("X-Auth-Token")
-    if not INBOUND_TOKEN or token != INBOUND_TOKEN:
-        raise HTTPException(status_code=401, detail="invalid token")
+    require_inbound_token(None, request)
 
     aclass, importance = simple_alert_parse(payload.subject, payload.text)
     atts = [a.model_dump() for a in (payload.attachments or [])]
