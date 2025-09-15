@@ -616,3 +616,8 @@ def webhook_telegram(request: Request):
         telegram_notify(f"🚫 거부 처리 완료 (ID {mail_id})")
         return {"ok": True, "action": "rejected", "id": mail_id}
     return {"ok": True, "skipped": "no_action"}
+
+
+from server.routes.mail_manage import router as mail_router
+
+app.include_router(mail_router)
