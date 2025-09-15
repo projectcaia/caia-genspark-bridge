@@ -560,3 +560,51 @@ def inbox_digest(limit: int = 10, token: Optional[str] = Query(None), request: R
     telegram_notify(msg)
     return {"ok": True, "lines": len(lines)}
 
+@app.post("/webhook/telegram")
+def webhook_telegram(request: Request):
+    # Telegram bot webhook receiver.
+    # If the user replies "승인" or "거부" to a bot message like "Mail #<id> ...",
+    # we flip approval flags in the DB accordingly.
+    # Auth: header X-Auth-Token must equal INBOUND_TOKEN (same as mail webhook).
+    require_inbound_token(None, request)
+    try:
+        upd = request.json()
+    except Exception:
+        upd = None
+    if upd is None:
+        try:
+            upd = json.loads(request.body())
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    msg = upd.get("message") or {}
+    text = (msg.get("text") or "").strip()
+    reply = msg.get("reply_to_message") or {}
+    original_text = (reply.get("text") or "")
+    # Extract mail id from "Mail #123" format
+    mail_id = None
+    try:
+        import re as _re
+        m = _re.search(r"Mail\s*#(\d+)", original_text)
+        if m:
+            mail_id = int(m.group(1))
+    except Exception:
+        pass
+    if not mail_id:
+        return {"ok": True, "skipped": "no_mail_id"}
+    low = text.lower()
+    if low.startswith("승인") or low.startswith("approve"):
+        conn = db()
+        conn.execute("UPDATE messages SET approved=1, processed=1, needs_approval=0 WHERE id=?", (mail_id,))
+        conn.commit()
+        conn.close()
+        telegram_notify(f"✅ 승인 처리 완료 (ID {mail_id})")
+        return {"ok": True, "action": "approved", "id": mail_id}
+    if low.startswith("거부") or low.startswith("reject"):
+        conn = db()
+        conn.execute("UPDATE messages SET approved=0, processed=1, needs_approval=0 WHERE id=?", (mail_id,))
+        conn.commit()
+        conn.close()
+        telegram_notify(f"🚫 거부 처리 완료 (ID {mail_id})")
+        return {"ok": True, "action": "rejected", "id": mail_id}
+    return {"ok": True, "skipped": "no_action"}
