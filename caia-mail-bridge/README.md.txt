@@ -4,11 +4,11 @@
 IMAP_HOST=imap.zoho.com
 IMAP_PORT=993
 IMAP_USER=jobs@caia-agent.com
-IMAP_PASSWORD=***  # 앱 비밀번호
+ZOHO_IMAP_PASSWORD=***  # 앱 비밀번호
 SMTP_HOST=smtp.zoho.com
 SMTP_PORT=465
 SMTP_USER=jobs@caia-agent.com
-SMTP_PASSWORD=***  # 앱 비밀번호
+ZOHO_SMTP_PASSWORD=***  # 앱 비밀번호
 POLL_INTERVAL_SEC=120
 SUBJECT_PREFIX=[CAIA-JOB]
 ZENSPARK_INBOX=jobs@caia-agent.com
