@@ -10,6 +10,7 @@ import imaplib
 from app import require_token, telegram_notify
 from server.utils.error_report import report_crit_error
 
+print("mail_router loaded")
 router = APIRouter(prefix="/mail")
 
 class DeleteRequest(BaseModel):
