@@ -7,7 +7,7 @@ import requests
 
 from app import require_token
 
-router = APIRouter()
+router = APIRouter(prefix="/mail")
 
 class DeleteRequest(BaseModel):
     id: int
@@ -22,7 +22,7 @@ def get_db():
     return conn
 
 
-@router.get("/mail/health")
+@router.get("/health")
 def mail_health():
     detail: dict[str, str] = {}
 
@@ -76,7 +76,7 @@ def mail_health():
     )
     return {"ok": overall_ok, "detail": detail}
 
-@router.post("/mail/delete")
+@router.post("/delete")
 def mail_delete(
     req: DeleteRequest,
     token: str | None = Query(None),
@@ -89,7 +89,7 @@ def mail_delete(
     conn.commit()
     return {"ok": True, "deleted_id": req.id}
 
-@router.post("/mail/auto-reply")
+@router.post("/auto-reply")
 def auto_reply(
     req: AutoReplyRequest,
     token: str | None = Query(None),
