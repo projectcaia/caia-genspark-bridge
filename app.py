@@ -12,6 +12,8 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, EmailStr
 import requests
 
+from server.utils.telegram_notify import send_approval_request
+
 
 # --- i18n env helper (supports Korean aliases) ---
 def env_get(names, default=""):
@@ -58,6 +60,10 @@ AUTO_NOTIFY_INBOUND = env_get(["AUTO_NOTIFY_INBOUND"], "true").lower() in ("1","
 ALERT_IMPORTANCE_MIN = float(os.getenv("ALERT_IMPORTANCE_MIN", "0.6"))
 DB_PATH       = os.getenv("DB_PATH", "mailbridge.sqlite3")
 
+# --- Approval rules ---
+APPROVAL_SENDERS = set(s.strip().lower() for s in os.getenv("APPROVAL_SENDERS", "").split(",") if s.strip())
+APPROVAL_IMPORTANCE_MIN = float(os.getenv("APPROVAL_IMPORTANCE_MIN", "0.8"))
+
 client = OpenAI(api_key=OPENAI_API_KEY) if (OPENAI_API_KEY and OpenAI) else None
 sg = SendGridAPIClient(api_key=SENDGRID_API_KEY) if (SENDGRID_API_KEY and SendGridAPIClient) else None
 
@@ -80,8 +86,24 @@ def init_db():
         attachments_json TEXT,
         created_at TEXT,
         alert_class TEXT,
-        importance REAL
+        importance REAL,
+        needs_approval INTEGER DEFAULT 0,
+        approved INTEGER DEFAULT 0,
+        processed INTEGER DEFAULT 0
     )""")
+    # ensure new columns for existing DBs
+    try:
+        conn.execute("ALTER TABLE messages ADD COLUMN needs_approval INTEGER DEFAULT 0")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE messages ADD COLUMN approved INTEGER DEFAULT 0")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE messages ADD COLUMN processed INTEGER DEFAULT 0")
+    except Exception:
+        pass
     conn.commit()
     conn.close()
 
@@ -117,6 +139,16 @@ def simple_alert_parse(subject: Optional[str], text: Optional[str]):
     bumps = sum(1 for w in hot_words if w in payload)
     importance = min(1.0, importance + bumps*0.15)
     return alert_class, importance
+
+def needs_approval_check(sender: str, importance: float, attachments: list) -> bool:
+    """Determine if mail needs manual approval."""
+    if attachments:
+        return True
+    if importance >= APPROVAL_IMPORTANCE_MIN:
+        return True
+    if sender.lower() in APPROVAL_SENDERS:
+        return True
+    return False
 
 def telegram_notify(text: str):
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
@@ -226,14 +258,15 @@ async def inbound_sen(
 
     # importance & class
     aclass, importance = simple_alert_parse(subject, text)
+    needs_appr = needs_approval_check(from_, importance, atts)
 
     # save to DB
     now = dt.datetime.utcnow().isoformat()
     conn = db()
     conn.execute("""
-        INSERT INTO messages(sender, recipients, subject, text, html, attachments_json, created_at, alert_class, importance)
-        VALUES(?,?,?,?,?,?,?,?,?)
-    """, (from_, to, subject, text, html, json.dumps(atts), now, aclass, importance))
+        INSERT INTO messages(sender, recipients, subject, text, html, attachments_json, created_at, alert_class, importance, needs_approval, approved, processed)
+        VALUES(?,?,?,?,?,?,?,?,?,?,0,0)
+    """, (from_, to, subject, text, html, json.dumps(atts), now, aclass, importance, needs_appr))
     msg_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
     conn.commit()
     conn.close()
@@ -241,8 +274,12 @@ async def inbound_sen(
     # Assistants v2 log (+ optional run)
     res = assistants_log_and_maybe_run(from_, to, subject, text, html)
 
-    # Telegram notify if important
-    if importance >= ALERT_IMPORTANCE_MIN:
+    if needs_appr:
+        try:
+            send_approval_request(msg_id, from_, subject)
+        except Exception:
+            pass
+    elif importance >= ALERT_IMPORTANCE_MIN:
         telegram_notify(f"[{aclass or 'INFO'}] {subject}\nfrom {from_}\n#{msg_id}")
 
     return {"ok": True, "id": msg_id, "assistant": res, "alert_class": aclass, "importance": importance}
@@ -255,12 +292,14 @@ def webhook_mail(payload: WebhookMailPayload, request: Request):
         raise HTTPException(status_code=401, detail="invalid token")
 
     aclass, importance = simple_alert_parse(payload.subject, payload.text)
+    atts = [a.model_dump() for a in (payload.attachments or [])]
+    needs_appr = needs_approval_check(payload.sender, importance, atts)
     now = dt.datetime.utcnow().isoformat()
     conn = db()
     conn.execute(
         """
-        INSERT INTO messages(sender, recipients, subject, text, html, attachments_json, created_at, alert_class, importance)
-        VALUES(?,?,?,?,?,?,?,?,?)
+        INSERT INTO messages(sender, recipients, subject, text, html, attachments_json, created_at, alert_class, importance, needs_approval, approved, processed)
+        VALUES(?,?,?,?,?,?,?,?,?,?,0,0)
         """,
         (
             payload.sender,
@@ -268,15 +307,23 @@ def webhook_mail(payload: WebhookMailPayload, request: Request):
             payload.subject,
             payload.text,
             None,
-            json.dumps([a.model_dump() for a in (payload.attachments or [])]),
+            json.dumps(atts),
             now,
             aclass,
             importance,
+            needs_appr,
         ),
     )
     msg_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
     conn.commit()
     conn.close()
+    if needs_appr:
+        try:
+            send_approval_request(msg_id, payload.sender, payload.subject or "")
+        except Exception:
+            pass
+    elif importance >= ALERT_IMPORTANCE_MIN:
+        telegram_notify(f"[{aclass or 'INFO'}] {payload.subject}\nfrom {payload.sender}\n#{msg_id}")
     return {"ok": True, "id": msg_id}
 
 
@@ -366,6 +413,49 @@ def mail_attach(
     if download:
         headers["Content-Disposition"] = f'attachment; filename="{filename}"'
     return StreamingResponse(io.BytesIO(raw), media_type=f.get("content_type","application/octet-stream"), headers=headers)
+
+@app.post("/mail/approve")
+def mail_approve(id: int = Query(...), token: Optional[str] = Query(None), request: Request = None):
+    require_token(token, request)
+    conn = db()
+    row = conn.execute("SELECT * FROM messages WHERE id=?", (id,)).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="not found")
+    conn.execute("UPDATE messages SET approved=1, processed=1, needs_approval=0 WHERE id=?", (id,))
+    conn.commit()
+    attachments = json.loads(row["attachments_json"] or "[]")
+    saved = []
+    for a in attachments:
+        try:
+            data = base64.b64decode(a.get("content_b64", ""))
+            fname = f"mail_{id}_{a.get('filename','attachment')}"
+            with open(fname, "wb") as f:
+                f.write(data)
+            saved.append(fname)
+        except Exception:
+            pass
+    conn.close()
+    if sg and row["sender"]:
+        try:
+            msg = Mail(from_email=Email(SENDER_DEFAULT), to_emails=[To(row["sender"])], subject=f"Re: {row['subject']}", plain_text_content=Content("text/plain", "Your mail has been processed."))
+            sg.send(msg)
+        except Exception:
+            pass
+    return {"ok": True, "id": id, "saved": saved}
+
+@app.post("/mail/reject")
+def mail_reject(id: int = Query(...), token: Optional[str] = Query(None), request: Request = None):
+    require_token(token, request)
+    conn = db()
+    row = conn.execute("SELECT id FROM messages WHERE id=?", (id,)).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="not found")
+    conn.execute("DELETE FROM messages WHERE id=?", (id,))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "id": id}
 
 @app.post("/mail/send")
 def mail_send(payload: SendMailPayload, token: Optional[str] = Query(None), request: Request = None):

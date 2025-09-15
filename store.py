@@ -2,6 +2,9 @@
 import sqlite3, os, time, json, hashlib
 from typing import List, Dict, Optional
 
+from app import simple_alert_parse, APPROVAL_IMPORTANCE_MIN, APPROVAL_SENDERS
+from server.utils.telegram_notify import send_approval_request
+
 DB_PATH = os.getenv("DB_PATH", "mailbridge.sqlite3")
 
 def _conn():
@@ -40,7 +43,10 @@ def _ensure_new_schema(c):
                 html TEXT,
                 atts TEXT,
                 ts   INTEGER,
-                hash TEXT
+                hash TEXT,
+                needs_approval INTEGER DEFAULT 0,
+                approved INTEGER DEFAULT 0,
+                processed INTEGER DEFAULT 0
             )
         """)
     # 인덱스(존재하면 무시)
@@ -51,6 +57,24 @@ def _ensure_new_schema(c):
         c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_msg_hash ON msg(hash)")
     except Exception:
         pass
+
+def _ensure_approval_columns(c):
+    cols = _get_msg_columns(c)
+    if "needs_approval" not in cols:
+        try:
+            c.execute("ALTER TABLE msg ADD COLUMN needs_approval INTEGER DEFAULT 0")
+        except Exception:
+            pass
+    if "approved" not in cols:
+        try:
+            c.execute("ALTER TABLE msg ADD COLUMN approved INTEGER DEFAULT 0")
+        except Exception:
+            pass
+    if "processed" not in cols:
+        try:
+            c.execute("ALTER TABLE msg ADD COLUMN processed INTEGER DEFAULT 0")
+        except Exception:
+            pass
 
 def _ensure_hash_column(c):
     """기존 신 스키마에 hash 컬럼이 없다면 추가 + 유니크 인덱스 생성."""
@@ -76,10 +100,11 @@ def init_db():
             _ensure_new_schema(c)
             c.commit()
         else:
-            # 기존 테이블이 있으면 인덱스/해시 컬럼만 보장
+            # 기존 테이블이 있으면 인덱스/해시/승인 컬럼 보장
             try:
                 _ensure_new_schema(c)
                 _ensure_hash_column(c)
+                _ensure_approval_columns(c)
                 c.commit()
             except Exception:
                 # 구스키마(uid 기반)일 수도 있으므로 조용히 통과
@@ -133,12 +158,20 @@ def save_messages(msgs: List[Dict]):
                 dt   = (m.get("date") or "").strip()
                 text = (m.get("text") or "").strip()
                 html = m.get("html")
-                atts = json.dumps(m.get("attachments") or [])
+                atts_list = m.get("attachments") or []
+                atts = json.dumps(atts_list)
+                _, importance = simple_alert_parse(subj, text)
+                needs_appr = bool(atts_list) or (importance >= APPROVAL_IMPORTANCE_MIN) or (frm.lower() in APPROVAL_SENDERS)
                 hval = _make_hash(frm, rcpt, subj, text)
-                c.execute(
-                    "INSERT OR IGNORE INTO msg(frm, rcpt, subj, dt, text, html, atts, ts, hash) VALUES(?,?,?,?,?,?,?,?,?)",
-                    (frm, rcpt, subj, dt, text, html, atts, now, hval)
+                cur = c.execute(
+                    "INSERT OR IGNORE INTO msg(frm, rcpt, subj, dt, text, html, atts, ts, hash, needs_approval, approved, processed) VALUES(?,?,?,?,?,?,?,?,?,?,0,0)",
+                    (frm, rcpt, subj, dt, text, html, atts, now, hval, needs_appr)
                 )
+                if cur.rowcount and needs_appr:
+                    try:
+                        send_approval_request(cur.lastrowid, frm, subj)
+                    except Exception:
+                        pass
             c.commit()
 
 def list_messages_since(since_id: Optional[int], limit: int = 20):
