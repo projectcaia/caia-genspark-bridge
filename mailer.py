@@ -9,6 +9,9 @@ from email.message import EmailMessage
 from email.utils import make_msgid, formatdate
 from typing import List, Optional, Dict, Any
 
+from app import telegram_notify
+from server.utils.error_report import report_crit_error
+
 
 async def send_email(
     smtp_host: str,
@@ -134,6 +137,7 @@ def _send_blocking(
         except (smtplib.SMTPException, OSError, ssl.SSLError) as e:
             last_err = e
             if attempt == retries:
+                report_crit_error(f"SMTP/IMAP failure: {e}", telegram_notify)
                 raise
             # 지수 백오프
             time.sleep(max(0.1, retry_backoff * (2 ** attempt)))
