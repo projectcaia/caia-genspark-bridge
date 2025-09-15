@@ -3,8 +3,6 @@ from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel
 import sqlite3
 
-from app import require_token
-
 router = APIRouter()
 
 class DeleteRequest(BaseModel):
@@ -19,12 +17,14 @@ def get_db():
     conn.row_factory = sqlite3.Row
     return conn
 
-@router.post("/mail/delete")
+@router.post("/delete")
 def mail_delete(
     req: DeleteRequest,
     token: str | None = Query(None),
     request: Request | None = None,
 ):
+    from app import require_token
+
     require_token(token, request)
     conn = get_db()
     cur = conn.cursor()
@@ -32,15 +32,23 @@ def mail_delete(
     conn.commit()
     return {"ok": True, "deleted_id": req.id}
 
-@router.post("/mail/auto-reply")
+
+@router.post("/auto-reply")
 def auto_reply(
     req: AutoReplyRequest,
     token: str | None = Query(None),
     request: Request | None = None,
 ):
+    from app import require_token
+
     require_token(token, request)
     conn = get_db()
     cur = conn.cursor()
     cur.execute("UPDATE messages SET replied=1 WHERE id=?", (req.id,))
     conn.commit()
     return {"ok": True, "replied_id": req.id, "text": req.reply_text}
+
+
+@router.get("/health")
+def health_check():
+    return {"ok": True}

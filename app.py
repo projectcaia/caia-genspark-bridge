@@ -13,6 +13,7 @@ from pydantic import BaseModel, EmailStr
 import requests
 
 from server.utils.telegram_notify import send_approval_request
+from server.routes import mail_manage
 
 
 # --- i18n env helper (supports Korean aliases) ---
@@ -43,6 +44,8 @@ app = FastAPI(
     openapi_version="3.1.0",
     servers=[{"url": "https://worker-production-4369.up.railway.app"}],
 )
+
+app.include_router(mail_manage.router, prefix="/mail")
 
 # === ENV ===
 SENDER_DEFAULT = os.getenv("SENDER_DEFAULT", "no-reply@example.com")
