@@ -3,9 +3,12 @@ from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel
 import sqlite3
 import os
-import requests
+import ssl
+import smtplib
+import imaplib
 
-from app import require_token
+from app import require_token, telegram_notify
+from server.utils.error_report import report_crit_error
 
 router = APIRouter(prefix="/mail")
 
@@ -39,42 +42,42 @@ def mail_health():
         except Exception:
             pass
 
-    # SendGrid check
-    sg_key = os.getenv("SENDGRID_API_KEY")
-    if sg_key:
+    # SMTP check
+    smtp_host = os.getenv("SMTP_HOST")
+    smtp_port = int(os.getenv("SMTP_PORT", "0")) if os.getenv("SMTP_PORT") else None
+    smtp_user = os.getenv("SMTP_USER")
+    smtp_pass = os.getenv("SMTP_PASSWORD") or os.getenv("ZOHO_SMTP_PASSWORD")
+    if smtp_host and smtp_port and smtp_user and smtp_pass:
         try:
-            r = requests.get(
-                "https://api.sendgrid.com/v3/user/account",
-                headers={"Authorization": f"Bearer {sg_key}"},
-                timeout=5,
-            )
-            detail["sendgrid"] = (
-                "ok" if r.status_code == 200 else f"error:{r.status_code}"
-            )
+            context = ssl.create_default_context()
+            with smtplib.SMTP_SSL(smtp_host, smtp_port, context=context, timeout=5) as s:
+                s.login(smtp_user, smtp_pass)
+            detail["smtp"] = "ok"
         except Exception as e:
-            detail["sendgrid"] = f"error:{e}"
+            detail["smtp"] = f"error:{e}"
     else:
-        detail["sendgrid"] = "missing"
+        detail["smtp"] = "missing"
 
-    # Telegram check
-    tg_token = os.getenv("TELEGRAM_BOT_TOKEN")
-    tg_chat = os.getenv("TELEGRAM_CHAT_ID")
-    if tg_token and tg_chat:
+    # IMAP check
+    imap_host = os.getenv("IMAP_HOST")
+    imap_port = int(os.getenv("IMAP_PORT", "0")) if os.getenv("IMAP_PORT") else None
+    imap_user = os.getenv("IMAP_USER")
+    imap_pass = os.getenv("IMAP_PASSWORD") or os.getenv("ZOHO_IMAP_PASSWORD")
+    if imap_host and imap_port and imap_user and imap_pass:
         try:
-            r = requests.get(
-                f"https://api.telegram.org/bot{tg_token}/getMe", timeout=5
-            )
-            ok = r.status_code == 200 and r.json().get("ok")
-            detail["telegram"] = "ok" if ok else f"error:{r.status_code}"
+            with imaplib.IMAP4_SSL(imap_host, imap_port) as imap:
+                imap.login(imap_user, imap_pass)
+            detail["imap"] = "ok"
         except Exception as e:
-            detail["telegram"] = f"error:{e}"
+            detail["imap"] = f"error:{e}"
     else:
-        detail["telegram"] = "missing"
+        detail["imap"] = "missing"
 
-    overall_ok = all(
-        v in ("ok", "missing") for v in detail.values()
-    )
-    return {"ok": overall_ok, "detail": detail}
+    overall_ok = all(v == "ok" for v in detail.values())
+    if not overall_ok:
+        report_crit_error(f"mail_health failed: {detail}", telegram_notify)
+        return {"ok": False, "detail": detail}
+    return {"ok": True}
 
 @router.post("/delete")
 def mail_delete(
