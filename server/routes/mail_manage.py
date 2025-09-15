@@ -28,7 +28,7 @@ def mail_delete(
     require_token(token, request)
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("UPDATE mails SET deleted=1 WHERE id=?", (req.id,))
+    cur.execute("UPDATE messages SET deleted=1 WHERE id=?", (req.id,))
     conn.commit()
     return {"ok": True, "deleted_id": req.id}
 
@@ -41,6 +41,6 @@ def auto_reply(
     require_token(token, request)
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("UPDATE mails SET replied=1 WHERE id=?", (req.id,))
+    cur.execute("UPDATE messages SET replied=1 WHERE id=?", (req.id,))
     conn.commit()
     return {"ok": True, "replied_id": req.id, "text": req.reply_text}

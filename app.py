@@ -89,7 +89,11 @@ def init_db():
         importance REAL,
         needs_approval INTEGER DEFAULT 0,
         approved INTEGER DEFAULT 0,
-        processed INTEGER DEFAULT 0
+        processed INTEGER DEFAULT 0,
+        deleted INTEGER DEFAULT 0,
+        replied INTEGER DEFAULT 0,
+        priority TEXT DEFAULT 'normal',
+        auto_reply INTEGER DEFAULT 0
     )""")
     # ensure new columns for existing DBs
     try:
@@ -102,6 +106,22 @@ def init_db():
         pass
     try:
         conn.execute("ALTER TABLE messages ADD COLUMN processed INTEGER DEFAULT 0")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE messages ADD COLUMN deleted INTEGER DEFAULT 0")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE messages ADD COLUMN replied INTEGER DEFAULT 0")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE messages ADD COLUMN priority TEXT DEFAULT 'normal'")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE messages ADD COLUMN auto_reply INTEGER DEFAULT 0")
     except Exception:
         pass
     conn.commit()
