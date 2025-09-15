@@ -46,7 +46,11 @@ def _ensure_new_schema(c):
                 hash TEXT,
                 needs_approval INTEGER DEFAULT 0,
                 approved INTEGER DEFAULT 0,
-                processed INTEGER DEFAULT 0
+                processed INTEGER DEFAULT 0,
+                ersp_event TEXT,
+                ersp_interpretation TEXT,
+                ersp_lesson TEXT,
+                ersp_if_then TEXT
             )
         """)
     # 인덱스(존재하면 무시)
@@ -89,6 +93,29 @@ def _ensure_hash_column(c):
     except Exception:
         pass
 
+def _ensure_ersp_columns(c):
+    cols = _get_msg_columns(c)
+    if "ersp_event" not in cols:
+        try:
+            c.execute("ALTER TABLE msg ADD COLUMN ersp_event TEXT")
+        except Exception:
+            pass
+    if "ersp_interpretation" not in cols:
+        try:
+            c.execute("ALTER TABLE msg ADD COLUMN ersp_interpretation TEXT")
+        except Exception:
+            pass
+    if "ersp_lesson" not in cols:
+        try:
+            c.execute("ALTER TABLE msg ADD COLUMN ersp_lesson TEXT")
+        except Exception:
+            pass
+    if "ersp_if_then" not in cols:
+        try:
+            c.execute("ALTER TABLE msg ADD COLUMN ersp_if_then TEXT")
+        except Exception:
+            pass
+
 def init_db():
     """
     - 테이블 없으면 신 스키마로 생성
@@ -105,6 +132,7 @@ def init_db():
                 _ensure_new_schema(c)
                 _ensure_hash_column(c)
                 _ensure_approval_columns(c)
+                _ensure_ersp_columns(c)
                 c.commit()
             except Exception:
                 # 구스키마(uid 기반)일 수도 있으므로 조용히 통과
@@ -163,9 +191,14 @@ def save_messages(msgs: List[Dict]):
                 _, importance = simple_alert_parse(subj, text)
                 needs_appr = bool(atts_list) or (importance >= APPROVAL_IMPORTANCE_MIN) or (frm.lower() in APPROVAL_SENDERS)
                 hval = _make_hash(frm, rcpt, subj, text)
+                ersp = m.get("ersp") or {}
+                ev = m.get("ersp_event") or ersp.get("event")
+                interp = m.get("ersp_interpretation") or ersp.get("interpretation")
+                lesson = m.get("ersp_lesson") or ersp.get("lesson")
+                if_then = m.get("ersp_if_then") or ersp.get("if_then")
                 cur = c.execute(
-                    "INSERT OR IGNORE INTO msg(frm, rcpt, subj, dt, text, html, atts, ts, hash, needs_approval, approved, processed) VALUES(?,?,?,?,?,?,?,?,?,?,0,0)",
-                    (frm, rcpt, subj, dt, text, html, atts, now, hval, needs_appr)
+                    "INSERT OR IGNORE INTO msg(frm, rcpt, subj, dt, text, html, atts, ts, hash, needs_approval, approved, processed, ersp_event, ersp_interpretation, ersp_lesson, ersp_if_then) VALUES(?,?,?,?,?,?,?,?,?,?,0,0,?,?,?,?)",
+                    (frm, rcpt, subj, dt, text, html, atts, now, hval, needs_appr, ev, interp, lesson, if_then)
                 )
                 if cur.rowcount and needs_appr:
                     try:
@@ -200,7 +233,11 @@ def list_messages_since(since_id: Optional[int], limit: int = 20):
                 {
                     "id": r[0], "from": r[1], "to": "",
                     "subject": r[2], "date": r[3], "text": r[4],
-                    "has_attachments": False
+                    "has_attachments": False,
+                    "ersp_event": None,
+                    "ersp_interpretation": None,
+                    "ersp_lesson": None,
+                    "ersp_if_then": None,
                 }
                 for r in rows
             ]
@@ -208,12 +245,12 @@ def list_messages_since(since_id: Optional[int], limit: int = 20):
             # 신 스키마(id AUTOINCREMENT)
             if since_id:
                 cur = c.execute(
-                    "SELECT id, frm, rcpt, subj, dt, text, atts FROM msg WHERE id > ? ORDER BY id DESC LIMIT ?",
+                    "SELECT id, frm, rcpt, subj, dt, text, atts, ersp_event, ersp_interpretation, ersp_lesson, ersp_if_then FROM msg WHERE id > ? ORDER BY id DESC LIMIT ?",
                     (since_id, limit)
                 )
             else:
                 cur = c.execute(
-                    "SELECT id, frm, rcpt, subj, dt, text, atts FROM msg ORDER BY id DESC LIMIT ?",
+                    "SELECT id, frm, rcpt, subj, dt, text, atts, ersp_event, ersp_interpretation, ersp_lesson, ersp_if_then FROM msg ORDER BY id DESC LIMIT ?",
                     (limit,)
                 )
             rows = cur.fetchall()
@@ -227,7 +264,11 @@ def list_messages_since(since_id: Optional[int], limit: int = 20):
                 out.append({
                     "id": r[0], "from": r[1], "to": r[2],
                     "subject": r[3], "date": r[4], "text": r[5],
-                    "has_attachments": has_atts
+                    "has_attachments": has_atts,
+                    "ersp_event": r[7],
+                    "ersp_interpretation": r[8],
+                    "ersp_lesson": r[9],
+                    "ersp_if_then": r[10],
                 })
             return out
 
@@ -258,8 +299,8 @@ def get_message_by_id(msg_id: int) -> Optional[Dict]:
             }
         else:
             cur = c.execute(
-                "SELECT id, frm, rcpt, subj, dt, text, html, atts FROM msg WHERE id = ? LIMIT 1",
-                (msg_id,)
+                "SELECT id, frm, rcpt, subj, dt, text, html, atts, ersp_event, ersp_interpretation, ersp_lesson, ersp_if_then FROM msg WHERE id = ? LIMIT 1",
+                (msg_id,),
             )
             row = cur.fetchone()
             if not row:
@@ -272,7 +313,11 @@ def get_message_by_id(msg_id: int) -> Optional[Dict]:
                 "id": row[0], "from": row[1], "to": row[2],
                 "subject": row[3], "date": row[4],
                 "text": row[5], "html": row[6],
-                "attachments": atts
+                "attachments": atts,
+                "ersp_event": row[8],
+                "ersp_interpretation": row[9],
+                "ersp_lesson": row[10],
+                "ersp_if_then": row[11],
             }
 
 # ===== KV 유틸 (중복 방지, 임시 상태 저장 등) =====

@@ -94,7 +94,11 @@ def init_db():
         deleted INTEGER DEFAULT 0,
         replied INTEGER DEFAULT 0,
         priority TEXT DEFAULT 'normal',
-        auto_reply INTEGER DEFAULT 0
+        auto_reply INTEGER DEFAULT 0,
+        ersp_event TEXT,
+        ersp_interpretation TEXT,
+        ersp_lesson TEXT,
+        ersp_if_then TEXT
     )""")
     # ensure new columns for existing DBs
     try:
@@ -123,6 +127,22 @@ def init_db():
         pass
     try:
         conn.execute("ALTER TABLE messages ADD COLUMN auto_reply INTEGER DEFAULT 0")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE messages ADD COLUMN ersp_event TEXT")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE messages ADD COLUMN ersp_interpretation TEXT")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE messages ADD COLUMN ersp_lesson TEXT")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE messages ADD COLUMN ersp_if_then TEXT")
     except Exception:
         pass
     conn.commit()
@@ -220,6 +240,7 @@ class SendMailPayload(BaseModel):
     cc: Optional[List[EmailStr]] = None
     bcc: Optional[List[EmailStr]] = None
     attachments_b64: Optional[List[dict]] = None  # [{filename, content_b64, content_type?}]
+    ersp: Optional[dict] = None
 
 class ToolSendReq(BaseModel):
     """툴에서 쓰기 쉬운 최소 필드 모델"""
@@ -227,6 +248,7 @@ class ToolSendReq(BaseModel):
     subject: str
     text: str
     html: Optional[str] = None
+    ersp: Optional[dict] = None
 
 class WebhookAttachment(BaseModel):
     filename: str
@@ -239,6 +261,7 @@ class WebhookMailPayload(BaseModel):
     subject: str | None = ""
     text: str | None = ""
     attachments: List[WebhookAttachment] | None = None
+    ersp: dict | None = None
 
 # === Routes ===
 @app.get("/ping")
@@ -274,6 +297,11 @@ async def inbound_sen(
     text: str = Form(""),
     html: Optional[str] = Form(None),
     attachments: Optional[List[UploadFile]] = File(None),
+    ersp: Optional[str] = Form(None),
+    ersp_event: Optional[str] = Form(None),
+    ersp_interpretation: Optional[str] = Form(None),
+    ersp_lesson: Optional[str] = Form(None),
+    ersp_if_then: Optional[str] = Form(None),
 ):
     # inbound token check
     require_inbound_token(token, request)
@@ -295,10 +323,21 @@ async def inbound_sen(
     # save to DB
     now = dt.datetime.utcnow().isoformat()
     conn = db()
+    ersp_map = {}
+    if ersp:
+        try:
+            ersp_map = json.loads(ersp)
+        except Exception:
+            ersp_map = {}
+    ev = ersp_event or ersp_map.get("event")
+    interp = ersp_interpretation or ersp_map.get("interpretation")
+    lesson = ersp_lesson or ersp_map.get("lesson")
+    if_then = ersp_if_then or ersp_map.get("if_then")
+
     conn.execute("""
-        INSERT INTO messages(sender, recipients, subject, text, html, attachments_json, created_at, alert_class, importance, needs_approval, approved, processed)
-        VALUES(?,?,?,?,?,?,?,?,?,?,0,0)
-    """, (from_, to, subject, text, html, json.dumps(atts), now, aclass, importance, needs_appr))
+        INSERT INTO messages(sender, recipients, subject, text, html, attachments_json, created_at, alert_class, importance, needs_approval, approved, processed, ersp_event, ersp_interpretation, ersp_lesson, ersp_if_then)
+        VALUES(?,?,?,?,?,?,?,?,?,?,0,0,?,?,?,?)
+    """, (from_, to, subject, text, html, json.dumps(atts), now, aclass, importance, needs_appr, ev, interp, lesson, if_then))
     msg_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
     conn.commit()
     conn.close()
@@ -328,10 +367,15 @@ def webhook_mail(payload: WebhookMailPayload, request: Request):
         now = dt.datetime.utcnow().isoformat()
         conn = db()
         try:
+            ersp = payload.ersp or {}
+            ev = ersp.get("event")
+            interp = ersp.get("interpretation")
+            lesson = ersp.get("lesson")
+            if_then = ersp.get("if_then")
             conn.execute(
                 """
-                INSERT INTO messages(sender, recipients, subject, text, html, attachments_json, created_at, alert_class, importance, needs_approval, approved, processed)
-                VALUES(?,?,?,?,?,?,?,?,?,?,0,0)
+                INSERT INTO messages(sender, recipients, subject, text, html, attachments_json, created_at, alert_class, importance, needs_approval, approved, processed, ersp_event, ersp_interpretation, ersp_lesson, ersp_if_then)
+                VALUES(?,?,?,?,?,?,?,?,?,?,0,0,?,?,?,?)
                 """,
                 (
                     payload.sender,
@@ -344,6 +388,10 @@ def webhook_mail(payload: WebhookMailPayload, request: Request):
                     aclass,
                     importance,
                     needs_appr,
+                    ev,
+                    interp,
+                    lesson,
+                    if_then,
                 ),
             )
             msg_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
@@ -374,7 +422,7 @@ def inbox_post(limit: int = 10, subject: Optional[str] = None, sender: Optional[
         args.append(f"%{sender}%")
     wh = ("WHERE " + " AND ".join(where)) if where else ""
     conn = db()
-    rows = conn.execute(f"SELECT id, sender, recipients, subject, substr(text,1,400) AS text, created_at FROM messages {wh} ORDER BY id DESC LIMIT ?", (*args, limit)).fetchall()
+    rows = conn.execute(f"SELECT id, sender, recipients, subject, substr(text,1,400) AS text, created_at, ersp_event, ersp_interpretation, ersp_lesson, ersp_if_then FROM messages {wh} ORDER BY id DESC LIMIT ?", (*args, limit)).fetchall()
     conn.close()
     return {"ok": True, "emails": [dict(r) for r in rows]}
 
@@ -385,7 +433,8 @@ def inbox_json(limit: int = 10, token: Optional[str] = Query(None), request: Req
     conn = db()
     rows = conn.execute("""
         SELECT id, sender, recipients, subject, substr(text,1,500) AS text, created_at, alert_class, importance,
-               CASE WHEN (attachments_json IS NOT NULL AND length(attachments_json) > 2 AND attachments_json != '[]') THEN 1 ELSE 0 END AS has_attachments
+               CASE WHEN (attachments_json IS NOT NULL AND length(attachments_json) > 2 AND attachments_json != '[]') THEN 1 ELSE 0 END AS has_attachments,
+               ersp_event, ersp_interpretation, ersp_lesson, ersp_if_then
         FROM messages ORDER BY id DESC LIMIT ?
     """, (limit,)).fetchall()
     conn.close()
@@ -397,7 +446,11 @@ def inbox_json(limit: int = 10, token: Optional[str] = Query(None), request: Req
             "subject": r["subject"],
             "date": r["created_at"],
             "text": r["text"],
-            "has_attachments": bool(r["has_attachments"])
+            "has_attachments": bool(r["has_attachments"]),
+            "ersp_event": r["ersp_event"],
+            "ersp_interpretation": r["ersp_interpretation"],
+            "ersp_lesson": r["ersp_lesson"],
+            "ersp_if_then": r["ersp_if_then"],
         } for r in rows
     ]}
 
@@ -420,6 +473,10 @@ def mail_view(id: int = Query(...), token: Optional[str] = Query(None), request:
         "text": data["text"],
         "html": data["html"],
         "attachments": data["attachments"],
+        "ersp_event": data.get("ersp_event"),
+        "ersp_interpretation": data.get("ersp_interpretation"),
+        "ersp_lesson": data.get("ersp_lesson"),
+        "ersp_if_then": data.get("ersp_if_then"),
     }}
 
 @app.get("/mail/attach")
@@ -521,6 +578,36 @@ def mail_send(payload: SendMailPayload, token: Optional[str] = Query(None), requ
     except Exception as e:
         report_crit_error(f"mail_send failed: {e}", telegram_notify)
         raise HTTPException(status_code=500, detail=f"SendGrid send failed: {e}")
+    recipients = payload.to + (payload.cc or []) + (payload.bcc or [])
+    now = dt.datetime.utcnow().isoformat()
+    aclass, importance = simple_alert_parse(payload.subject, payload.text)
+    ersp = payload.ersp or {}
+    conn = db()
+    try:
+        conn.execute(
+            """
+            INSERT INTO messages(sender, recipients, subject, text, html, attachments_json, created_at, alert_class, importance, needs_approval, approved, processed, ersp_event, ersp_interpretation, ersp_lesson, ersp_if_then)
+            VALUES(?,?,?,?,?,?,?,?,?,0,1,1,?,?,?,?)
+            """,
+            (
+                SENDER_DEFAULT,
+                ",".join(recipients),
+                payload.subject,
+                payload.text,
+                payload.html,
+                json.dumps(payload.attachments_b64 or []),
+                now,
+                aclass,
+                importance,
+                ersp.get("event"),
+                ersp.get("interpretation"),
+                ersp.get("lesson"),
+                ersp.get("if_then"),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
     return {
         "ok": True,
         "message": "메일이 성공적으로 발송되었습니다.",
@@ -545,6 +632,7 @@ def tool_send(payload: ToolSendReq, token: Optional[str] = Query(None), request:
         subject=payload.subject,
         text=payload.text,
         html=payload.html,
+        ersp=payload.ersp,
     )
     # mail_send의 표준 응답 그대로 전달
     res = mail_send(model, token, request)
