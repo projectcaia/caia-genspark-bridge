@@ -13,6 +13,7 @@ from pydantic import BaseModel, EmailStr
 import requests
 
 from server.utils.telegram_notify import send_approval_request
+from server.utils.error_report import report_crit_error
 
 
 # --- i18n env helper (supports Korean aliases) ---
@@ -320,40 +321,43 @@ async def inbound_sen(
 def webhook_mail(payload: WebhookMailPayload, request: Request):
     require_inbound_token(None, request)
 
-    aclass, importance = simple_alert_parse(payload.subject, payload.text)
-    atts = [a.model_dump() for a in (payload.attachments or [])]
-    needs_appr = needs_approval_check(payload.sender, importance, atts)
-    now = dt.datetime.utcnow().isoformat()
-    conn = db()
-    conn.execute(
-        """
-        INSERT INTO messages(sender, recipients, subject, text, html, attachments_json, created_at, alert_class, importance, needs_approval, approved, processed)
-        VALUES(?,?,?,?,?,?,?,?,?,?,0,0)
-        """,
-        (
-            payload.sender,
-            payload.recipients,
-            payload.subject,
-            payload.text,
-            None,
-            json.dumps(atts),
-            now,
-            aclass,
-            importance,
-            needs_appr,
-        ),
-    )
-    msg_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
-    conn.commit()
-    conn.close()
-    if needs_appr:
+    try:
+        aclass, importance = simple_alert_parse(payload.subject, payload.text)
+        atts = [a.model_dump() for a in (payload.attachments or [])]
+        needs_appr = needs_approval_check(payload.sender, importance, atts)
+        now = dt.datetime.utcnow().isoformat()
+        conn = db()
         try:
+            conn.execute(
+                """
+                INSERT INTO messages(sender, recipients, subject, text, html, attachments_json, created_at, alert_class, importance, needs_approval, approved, processed)
+                VALUES(?,?,?,?,?,?,?,?,?,?,0,0)
+                """,
+                (
+                    payload.sender,
+                    payload.recipients,
+                    payload.subject,
+                    payload.text,
+                    None,
+                    json.dumps(atts),
+                    now,
+                    aclass,
+                    importance,
+                    needs_appr,
+                ),
+            )
+            msg_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+            conn.commit()
+        finally:
+            conn.close()
+        if needs_appr:
             send_approval_request(msg_id, payload.sender, payload.subject or "")
-        except Exception:
-            pass
-    elif importance >= ALERT_IMPORTANCE_MIN:
-        telegram_notify(f"[{aclass or 'INFO'}] {payload.subject}\nfrom {payload.sender}\n#{msg_id}")
-    return {"ok": True, "id": msg_id}
+        elif importance >= ALERT_IMPORTANCE_MIN:
+            telegram_notify(f"[{aclass or 'INFO'}] {payload.subject}\nfrom {payload.sender}\n#{msg_id}")
+        return {"ok": True, "id": msg_id}
+    except Exception as e:
+        report_crit_error(f"webhook_mail failed: {e}", telegram_notify)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/mail/inbox")
@@ -512,7 +516,11 @@ def mail_send(payload: SendMailPayload, token: Optional[str] = Query(None), requ
             att_objs.append(att)
         message.attachment = att_objs
 
-    resp = sg.send(message)
+    try:
+        resp = sg.send(message)
+    except Exception as e:
+        report_crit_error(f"mail_send failed: {e}", telegram_notify)
+        raise HTTPException(status_code=500, detail=f"SendGrid send failed: {e}")
     return {
         "ok": True,
         "message": "메일이 성공적으로 발송되었습니다.",
