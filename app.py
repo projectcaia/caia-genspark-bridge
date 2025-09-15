@@ -13,6 +13,7 @@ from pydantic import BaseModel, EmailStr
 import requests
 
 from server.utils.telegram_notify import send_approval_request
+from server.tasks import initialize_main_chat_routines
 
 
 # --- i18n env helper (supports Korean aliases) ---
@@ -128,6 +129,12 @@ def init_db():
     conn.close()
 
 init_db()
+
+# === Routines ===
+@app.on_event("startup")
+def _initialize_routines() -> None:
+    """Start background maintenance tasks on app startup."""
+    initialize_main_chat_routines()
 
 # === Helpers ===
 def _bearer_from_header(request: Request) -> Optional[str]:
