@@ -1,7 +1,9 @@
 # server/routes/mail_manage.py
-from fastapi import APIRouter
+from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel
 import sqlite3
+
+from app import require_token
 
 router = APIRouter()
 
@@ -18,7 +20,12 @@ def get_db():
     return conn
 
 @router.post("/mail/delete")
-def mail_delete(req: DeleteRequest):
+def mail_delete(
+    req: DeleteRequest,
+    token: str | None = Query(None),
+    request: Request | None = None,
+):
+    require_token(token, request)
     conn = get_db()
     cur = conn.cursor()
     cur.execute("UPDATE mails SET deleted=1 WHERE id=?", (req.id,))
@@ -26,7 +33,12 @@ def mail_delete(req: DeleteRequest):
     return {"ok": True, "deleted_id": req.id}
 
 @router.post("/mail/auto-reply")
-def auto_reply(req: AutoReplyRequest):
+def auto_reply(
+    req: AutoReplyRequest,
+    token: str | None = Query(None),
+    request: Request | None = None,
+):
+    require_token(token, request)
     conn = get_db()
     cur = conn.cursor()
     cur.execute("UPDATE mails SET replied=1 WHERE id=?", (req.id,))
