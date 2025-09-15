@@ -18,8 +18,8 @@ def _conn():
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
-def _get_msg_columns(c) -> List[str]:
-    cur = c.execute("PRAGMA table_info(msg)")
+def _get_messages_columns(c) -> List[str]:
+    cur = c.execute("PRAGMA table_info(messages)")
     return [row[1] for row in cur.fetchall()]
 
 def _table_exists(c, name: str) -> bool:
@@ -31,9 +31,9 @@ def _ensure_new_schema(c):
     신 스키마(id AUTOINCREMENT) 없으면 생성.
     필요한 보조 인덱스도 같이 생성.
     """
-    if not _table_exists(c, "msg"):
+    if not _table_exists(c, "messages"):
         c.execute("""
-            CREATE TABLE msg (
+            CREATE TABLE messages (
                 id   INTEGER PRIMARY KEY AUTOINCREMENT,
                 frm  TEXT,
                 rcpt TEXT,
@@ -54,65 +54,65 @@ def _ensure_new_schema(c):
             )
         """)
     # 인덱스(존재하면 무시)
-    c.execute("CREATE INDEX IF NOT EXISTS idx_msg_id  ON msg(id)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_msg_ts  ON msg(ts)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_messages_id  ON messages(id)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_messages_ts  ON messages(ts)")
     # 디듀프용 유니크 인덱스 (이미 있으면 무시)
     try:
-        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_msg_hash ON msg(hash)")
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_hash ON messages(hash)")
     except Exception:
         pass
 
 def _ensure_approval_columns(c):
-    cols = _get_msg_columns(c)
+    cols = _get_messages_columns(c)
     if "needs_approval" not in cols:
         try:
-            c.execute("ALTER TABLE msg ADD COLUMN needs_approval INTEGER DEFAULT 0")
+            c.execute("ALTER TABLE messages ADD COLUMN needs_approval INTEGER DEFAULT 0")
         except Exception:
             pass
     if "approved" not in cols:
         try:
-            c.execute("ALTER TABLE msg ADD COLUMN approved INTEGER DEFAULT 0")
+            c.execute("ALTER TABLE messages ADD COLUMN approved INTEGER DEFAULT 0")
         except Exception:
             pass
     if "processed" not in cols:
         try:
-            c.execute("ALTER TABLE msg ADD COLUMN processed INTEGER DEFAULT 0")
+            c.execute("ALTER TABLE messages ADD COLUMN processed INTEGER DEFAULT 0")
         except Exception:
             pass
 
 def _ensure_hash_column(c):
     """기존 신 스키마에 hash 컬럼이 없다면 추가 + 유니크 인덱스 생성."""
-    cols = _get_msg_columns(c)
+    cols = _get_messages_columns(c)
     if "hash" not in cols:
         try:
-            c.execute("ALTER TABLE msg ADD COLUMN hash TEXT")
+            c.execute("ALTER TABLE messages ADD COLUMN hash TEXT")
         except Exception:
             pass
     try:
-        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_msg_hash ON msg(hash)")
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_hash ON messages(hash)")
     except Exception:
         pass
 
 def _ensure_ersp_columns(c):
-    cols = _get_msg_columns(c)
+    cols = _get_messages_columns(c)
     if "ersp_event" not in cols:
         try:
-            c.execute("ALTER TABLE msg ADD COLUMN ersp_event TEXT")
+            c.execute("ALTER TABLE messages ADD COLUMN ersp_event TEXT")
         except Exception:
             pass
     if "ersp_interpretation" not in cols:
         try:
-            c.execute("ALTER TABLE msg ADD COLUMN ersp_interpretation TEXT")
+            c.execute("ALTER TABLE messages ADD COLUMN ersp_interpretation TEXT")
         except Exception:
             pass
     if "ersp_lesson" not in cols:
         try:
-            c.execute("ALTER TABLE msg ADD COLUMN ersp_lesson TEXT")
+            c.execute("ALTER TABLE messages ADD COLUMN ersp_lesson TEXT")
         except Exception:
             pass
     if "ersp_if_then" not in cols:
         try:
-            c.execute("ALTER TABLE msg ADD COLUMN ersp_if_then TEXT")
+            c.execute("ALTER TABLE messages ADD COLUMN ersp_if_then TEXT")
         except Exception:
             pass
 
@@ -123,7 +123,13 @@ def init_db():
     - kv 테이블은 공용 상태저장용으로 항상 보장
     """
     with _conn() as c:
-        if not _table_exists(c, "msg"):
+        if not _table_exists(c, "messages"):
+            # 이전 이름이 msg인 경우 자동 마이그레이션
+            if _table_exists(c, "msg"):
+                c.execute("ALTER TABLE msg RENAME TO messages")
+                c.execute("DROP INDEX IF EXISTS idx_msg_id")
+                c.execute("DROP INDEX IF EXISTS idx_msg_ts")
+                c.execute("DROP INDEX IF EXISTS idx_msg_hash")
             _ensure_new_schema(c)
             c.commit()
         else:
@@ -141,7 +147,7 @@ def init_db():
         c.commit()
 
 def _is_old_uid_schema(c) -> bool:
-    cols = _get_msg_columns(c)
+    cols = _get_messages_columns(c)
     # 옛 스키마: uid, frm, subj, dt, text, html, ts
     return ("uid" in cols) and ("frm" in cols) and ("subj" in cols)
 
@@ -173,7 +179,7 @@ def save_messages(msgs: List[Dict]):
                 text = m.get("text", "")
                 html = m.get("html")
                 c.execute(
-                    "INSERT OR IGNORE INTO msg(uid, frm, subj, dt, text, html, ts) VALUES(?,?,?,?,?,?,?)",
+                    "INSERT OR IGNORE INTO messages(uid, frm, subj, dt, text, html, ts) VALUES(?,?,?,?,?,?,?)",
                     (int(uid), frm, subj, dt, text, html, now)
                 )
             c.commit()
@@ -197,7 +203,7 @@ def save_messages(msgs: List[Dict]):
                 lesson = m.get("ersp_lesson") or ersp.get("lesson")
                 if_then = m.get("ersp_if_then") or ersp.get("if_then")
                 cur = c.execute(
-                    "INSERT OR IGNORE INTO msg(frm, rcpt, subj, dt, text, html, atts, ts, hash, needs_approval, approved, processed, ersp_event, ersp_interpretation, ersp_lesson, ersp_if_then) VALUES(?,?,?,?,?,?,?,?,?,?,0,0,?,?,?,?)",
+                    "INSERT OR IGNORE INTO messages(frm, rcpt, subj, dt, text, html, atts, ts, hash, needs_approval, approved, processed, ersp_event, ersp_interpretation, ersp_lesson, ersp_if_then) VALUES(?,?,?,?,?,?,?,?,?,?,0,0,?,?,?,?)",
                     (frm, rcpt, subj, dt, text, html, atts, now, hval, needs_appr, ev, interp, lesson, if_then)
                 )
                 if cur.rowcount and needs_appr:
@@ -220,12 +226,12 @@ def list_messages_since(since_id: Optional[int], limit: int = 20):
             # 구 스키마는 uid를 정렬 기준으로 사용
             if since_id:
                 cur = c.execute(
-                    "SELECT uid, frm, subj, dt, text FROM msg WHERE uid > ? ORDER BY uid DESC LIMIT ?",
+                    "SELECT uid, frm, subj, dt, text FROM messages WHERE uid > ? ORDER BY uid DESC LIMIT ?",
                     (since_id, limit)
                 )
             else:
                 cur = c.execute(
-                    "SELECT uid, frm, subj, dt, text FROM msg ORDER BY uid DESC LIMIT ?",
+                    "SELECT uid, frm, subj, dt, text FROM messages ORDER BY uid DESC LIMIT ?",
                     (limit,)
                 )
             rows = cur.fetchall()
@@ -245,12 +251,12 @@ def list_messages_since(since_id: Optional[int], limit: int = 20):
             # 신 스키마(id AUTOINCREMENT)
             if since_id:
                 cur = c.execute(
-                    "SELECT id, frm, rcpt, subj, dt, text, atts, ersp_event, ersp_interpretation, ersp_lesson, ersp_if_then FROM msg WHERE id > ? ORDER BY id DESC LIMIT ?",
+                    "SELECT id, frm, rcpt, subj, dt, text, atts, ersp_event, ersp_interpretation, ersp_lesson, ersp_if_then FROM messages WHERE id > ? ORDER BY id DESC LIMIT ?",
                     (since_id, limit)
                 )
             else:
                 cur = c.execute(
-                    "SELECT id, frm, rcpt, subj, dt, text, atts, ersp_event, ersp_interpretation, ersp_lesson, ersp_if_then FROM msg ORDER BY id DESC LIMIT ?",
+                    "SELECT id, frm, rcpt, subj, dt, text, atts, ersp_event, ersp_interpretation, ersp_lesson, ersp_if_then FROM messages ORDER BY id DESC LIMIT ?",
                     (limit,)
                 )
             rows = cur.fetchall()
@@ -285,7 +291,7 @@ def get_message_by_id(msg_id: int) -> Optional[Dict]:
     with _conn() as c:
         if _is_old_uid_schema(c):
             cur = c.execute(
-                "SELECT uid, frm, subj, dt, text, html FROM msg WHERE uid = ? LIMIT 1",
+                "SELECT uid, frm, subj, dt, text, html FROM messages WHERE uid = ? LIMIT 1",
                 (msg_id,)
             )
             row = cur.fetchone()
@@ -299,7 +305,7 @@ def get_message_by_id(msg_id: int) -> Optional[Dict]:
             }
         else:
             cur = c.execute(
-                "SELECT id, frm, rcpt, subj, dt, text, html, atts, ersp_event, ersp_interpretation, ersp_lesson, ersp_if_then FROM msg WHERE id = ? LIMIT 1",
+                "SELECT id, frm, rcpt, subj, dt, text, html, atts, ersp_event, ersp_interpretation, ersp_lesson, ersp_if_then FROM messages WHERE id = ? LIMIT 1",
                 (msg_id,),
             )
             row = cur.fetchone()
