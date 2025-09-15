@@ -8,12 +8,12 @@ load_dotenv()
 IMAP_HOST = os.getenv("IMAP_HOST", "imap.zoho.com")
 IMAP_PORT = int(os.getenv("IMAP_PORT", "993"))
 IMAP_USER = os.getenv("IMAP_USER")
-IMAP_PASSWORD = os.getenv("IMAP_PASSWORD")
+ZOHO_IMAP_PASSWORD = os.getenv("ZOHO_IMAP_PASSWORD")
 
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.zoho.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
 SMTP_USER = os.getenv("SMTP_USER")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+ZOHO_SMTP_PASSWORD = os.getenv("ZOHO_SMTP_PASSWORD")
 
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SEC", "120"))
 SUBJECT_PREFIX = os.getenv("SUBJECT_PREFIX", "[CAIA-JOB]")
@@ -29,7 +29,7 @@ def send_mail(to_addr: str, subject: str, body_text: str):
 
     context = ssl.create_default_context()
     with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context) as s:
-        s.login(SMTP_USER, SMTP_PASSWORD)
+        s.login(SMTP_USER, ZOHO_SMTP_PASSWORD)
         s.send_message(msg)
 
 def parse_job_json_from_body(body: str):
@@ -57,7 +57,7 @@ def parse_job_json_from_body(body: str):
 def fetch_unseen_jobs():
     context = ssl.create_default_context()
     with IMAPClient(IMAP_HOST, port=IMAP_PORT, ssl=True, ssl_context=context) as server:
-        server.login(IMAP_USER, IMAP_PASSWORD)
+        server.login(IMAP_USER, ZOHO_IMAP_PASSWORD)
         server.select_folder("INBOX")
         # 제목 패턴: [CAIA-JOB]
         messages = server.search(['UNSEEN', 'SUBJECT', SUBJECT_PREFIX])
@@ -153,7 +153,7 @@ def main_loop():
         time.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":
-    required = [IMAP_USER, IMAP_PASSWORD, SMTP_USER, SMTP_PASSWORD]
+    required = [IMAP_USER, ZOHO_IMAP_PASSWORD, SMTP_USER, ZOHO_SMTP_PASSWORD]
     if not all(required):
-        raise SystemExit("환경변수(IMAP_*, SMTP_*)가 설정되지 않았습니다.")
+        raise SystemExit("환경변수(IMAP_*, SMTP_*, ZOHO_*)가 설정되지 않았습니다.")
     main_loop()
