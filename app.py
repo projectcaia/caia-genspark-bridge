@@ -163,6 +163,18 @@ class ToolSendReq(BaseModel):
     text: str
     html: Optional[str] = None
 
+class WebhookAttachment(BaseModel):
+    filename: str
+    content_b64: str
+    content_type: str | None = None
+
+class WebhookMailPayload(BaseModel):
+    sender: str
+    recipients: str
+    subject: str | None = ""
+    text: str | None = ""
+    attachments: List[WebhookAttachment] | None = None
+
 # === Routes ===
 @app.get("/ping")
 def ping():
@@ -234,6 +246,38 @@ async def inbound_sen(
         telegram_notify(f"[{aclass or 'INFO'}] {subject}\nfrom {from_}\n#{msg_id}")
 
     return {"ok": True, "id": msg_id, "assistant": res, "alert_class": aclass, "importance": importance}
+
+
+@app.post("/webhook/mail")
+def webhook_mail(payload: WebhookMailPayload, request: Request):
+    token = request.headers.get("X-Auth-Token")
+    if not INBOUND_TOKEN or token != INBOUND_TOKEN:
+        raise HTTPException(status_code=401, detail="invalid token")
+
+    aclass, importance = simple_alert_parse(payload.subject, payload.text)
+    now = dt.datetime.utcnow().isoformat()
+    conn = db()
+    conn.execute(
+        """
+        INSERT INTO messages(sender, recipients, subject, text, html, attachments_json, created_at, alert_class, importance)
+        VALUES(?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            payload.sender,
+            payload.recipients,
+            payload.subject,
+            payload.text,
+            None,
+            json.dumps([a.model_dump() for a in (payload.attachments or [])]),
+            now,
+            aclass,
+            importance,
+        ),
+    )
+    msg_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+    conn.commit()
+    conn.close()
+    return {"ok": True, "id": msg_id}
 
 
 @app.post("/mail/inbox")
