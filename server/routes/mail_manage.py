@@ -82,8 +82,8 @@ def mail_health():
 @router.post("/delete")
 def mail_delete(
     req: DeleteRequest,
+    request: Request,
     token: str | None = Query(None),
-    request: Request | None = None,
 ):
     require_token(token, request)
     conn = get_db()
@@ -95,8 +95,8 @@ def mail_delete(
 @router.post("/auto-reply")
 def auto_reply(
     req: AutoReplyRequest,
+    request: Request,
     token: str | None = Query(None),
-    request: Request | None = None,
 ):
     require_token(token, request)
     conn = get_db()
