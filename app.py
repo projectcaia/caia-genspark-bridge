@@ -124,6 +124,19 @@ def init_db():
         conn.execute("ALTER TABLE messages ADD COLUMN auto_reply INTEGER DEFAULT 0")
     except Exception:
         pass
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ersp (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id INTEGER,
+            event TEXT,
+            interpretation TEXT,
+            lesson TEXT,
+            if_then TEXT,
+            FOREIGN KEY(message_id) REFERENCES messages(id)
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -204,6 +217,30 @@ def assistants_log_and_maybe_run(sender: str, recipients: str, subject: str, tex
     if AUTO_RUN and ASSISTANT_ID:
         run = client.beta.threads.runs.create(thread_id=THREAD_ID, assistant_id=ASSISTANT_ID)
     return {"thread_message_id": msg.id, "run_id": getattr(run, "id", None) if run else None}
+
+
+def generate_ersp(subject: str, text: str):
+    """Generate ERSP (event, interpretation, lesson, if_then) using OpenAI."""
+    if not client:
+        return None
+    prompt = (
+        "Analyze the following email and extract an ERSP summary as JSON with keys "
+        "'event', 'interpretation', 'lesson', and 'if_then'.\n"
+        f"Subject: {subject or ''}\n"
+        f"Body: {text or ''}\n"
+        "Respond with a JSON object."
+    )
+    try:
+        resp = client.responses.create(
+            model="gpt-4o-mini",
+            input=prompt,
+            response_format={"type": "json_object"},
+            temperature=0.2,
+        )
+        content = resp.output[0].content[0].text
+        return json.loads(content)
+    except Exception:
+        return None
 
 def b64_of_upload(f: UploadFile) -> str:
     data = f.file.read()
@@ -299,6 +336,18 @@ async def inbound_sen(
         VALUES(?,?,?,?,?,?,?,?,?,?,0,0)
     """, (from_, to, subject, text, html, json.dumps(atts), now, aclass, importance, needs_appr))
     msg_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+    ersp = generate_ersp(subject, text)
+    if ersp:
+        conn.execute(
+            "INSERT INTO ersp(message_id, event, interpretation, lesson, if_then) VALUES(?,?,?,?,?)",
+            (
+                msg_id,
+                ersp.get("event"),
+                ersp.get("interpretation"),
+                ersp.get("lesson"),
+                ersp.get("if_then"),
+            ),
+        )
     conn.commit()
     conn.close()
 
@@ -344,6 +393,18 @@ def webhook_mail(payload: WebhookMailPayload, request: Request):
         ),
     )
     msg_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+    ersp = generate_ersp(payload.subject, payload.text)
+    if ersp:
+        conn.execute(
+            "INSERT INTO ersp(message_id, event, interpretation, lesson, if_then) VALUES(?,?,?,?,?)",
+            (
+                msg_id,
+                ersp.get("event"),
+                ersp.get("interpretation"),
+                ersp.get("lesson"),
+                ersp.get("if_then"),
+            ),
+        )
     conn.commit()
     conn.close()
     if needs_appr:
@@ -417,6 +478,20 @@ def mail_view(id: int = Query(...), token: Optional[str] = Query(None), request:
         "html": data["html"],
         "attachments": data["attachments"],
     }}
+
+
+@app.get("/mail/ersp")
+def mail_ersp(id: int = Query(...), token: Optional[str] = Query(None), request: Request = None):
+    require_token(token, request)
+    conn = db()
+    row = conn.execute(
+        "SELECT event, interpretation, lesson, if_then FROM ersp WHERE message_id=?",
+        (id,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="not found")
+    return {"ok": True, "ersp": dict(row)}
 
 @app.get("/mail/attach")
 def mail_attach(
