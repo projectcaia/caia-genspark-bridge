@@ -1,4 +1,4 @@
-# app.py (FULL REPLACEMENT - with /tool/send and /inbound/sen added)
+# app.py (SendGrid Inbound Parse 전용 - IMAP 제거)
 import os
 import io
 import ssl
@@ -10,8 +10,6 @@ from typing import List, Optional
 
 import requests
 import smtplib
-import imaplib
-import email
 from email.message import EmailMessage
 
 from fastapi import FastAPI, Request, UploadFile, Form, File, Query, HTTPException
@@ -34,7 +32,7 @@ APP_VER = "2025-09-16"
 
 app = FastAPI(
     title="Caia Mail Bridge",
-    version="2.4.1",
+    version="2.4.2",
     openapi_version="3.1.0",
     servers=[{"url": "https://mail-bridge.up.railway.app"}],
 )
@@ -65,19 +63,12 @@ ASSISTANT_ID = os.getenv("ASSISTANT_ID", "")
 THREAD_ID = os.getenv("THREAD_ID", "")
 AUTO_RUN = os.getenv("AUTO_RUN", "false").lower() in ("1","true","yes")
 
-# SMTP (Zoho)
+# SMTP (Zoho) - 발신 전용
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.zoho.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
 SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASS = env_get(["ZOHO_SMTP_PASSWORD", "SMTP_PASSWORD"], "")
 SMTP_SSL = os.getenv("SMTP_SSL", "true").lower() in ("1","true","yes")
-
-# IMAP (Zoho)
-IMAP_HOST = os.getenv("IMAP_HOST", "imap.zoho.com")
-IMAP_PORT = int(os.getenv("IMAP_PORT", "993"))
-IMAP_USER = os.getenv("IMAP_USER", "")
-IMAP_PASS = env_get(["ZOHO_IMAP_PASSWORD", "IMAP_PASSWORD"], "")
-IMAP_SECURE = os.getenv("IMAP_SECURE", "true").lower() in ("1","true","yes")
 
 # SendGrid
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "")
@@ -282,78 +273,6 @@ def send_email(payload: SendMailPayload):
     send_via_smtp(payload)
     return {"via": "smtp", "status_code": 250}
 
-# ===== IMAP Poll =====
-def imap_poll(limit: int = 20) -> int:
-    print(f"[IMAP] host={IMAP_HOST} port={IMAP_PORT} secure={IMAP_SECURE} user={IMAP_USER}")
-    if not IMAP_USER or not IMAP_PASS:
-        print("[IMAP] missing credentials")
-        return 0
-    try:
-        if IMAP_SECURE:
-            m = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
-        else:
-            m = imaplib.IMAP4(IMAP_HOST, IMAP_PORT)
-        m.login(IMAP_USER, IMAP_PASS)
-        m.select("INBOX")
-        typ, data = m.search(None, "ALL")
-        if typ != "OK":
-            m.logout()
-            return 0
-
-        ids = data[0].split()
-        if not ids:
-            m.logout()
-            return 0
-        ids = ids[-limit:]
-
-        stored = 0
-        for uid in ids[::-1]:
-            typ, msg_data = m.fetch(uid, "(RFC822)")
-            if typ != "OK" or not msg_data or not msg_data[0]:
-                continue
-            raw = msg_data[0][1]
-            em = email.message_from_bytes(raw)
-            sender = (email.utils.parseaddr(em.get("From"))[1] or "").strip()
-            recipients = (em.get("To") or "").strip()
-            subject = (em.get("Subject") or "").strip()
-            text, html = "", None
-            atts = []
-            if em.is_multipart():
-                for part in em.walk():
-                    cdispo = (part.get("Content-Disposition") or "").lower()
-                    ctype = part.get_content_type()
-                    if cdispo.startswith("attachment"):
-                        fn = part.get_filename() or "attachment"
-                        payload = part.get_payload(decode=True) or b""
-                        atts.append({
-                            "filename": fn,
-                            "content_b64": base64.b64encode(payload).decode("utf-8"),
-                            "content_type": ctype or "application/octet-stream"
-                        })
-                    elif ctype == "text/plain":
-                        text += (part.get_payload(decode=True) or b"").decode(part.get_content_charset() or "utf-8", errors="ignore")
-                    elif ctype == "text/html":
-                        html = (part.get_payload(decode=True) or b"").decode(part.get_content_charset() or "utf-8", errors="ignore")
-            else:
-                if (em.get_content_type() or "") == "text/plain":
-                    text = (em.get_payload(decode=True) or b"").decode(em.get_content_charset() or "utf-8", errors="ignore")
-
-            aclass, importance = simple_alert_parse(subject, text)
-            conn = db()
-            conn.execute("""
-                INSERT INTO messages(sender, recipients, subject, text, html, attachments_json, created_at, alert_class, importance)
-                VALUES(?,?,?,?,?,?,?,?,?)
-            """, (sender, recipients, subject, text, html, json.dumps(atts), dt.datetime.utcnow().isoformat(), aclass, importance))
-            conn.commit()
-            conn.close()
-            stored += 1
-        m.logout()
-        print(f"[IMAP] stored={stored}")
-        return stored
-    except Exception as e:
-        print(f"[IMAP ERROR] {e}")
-        return 0
-
 # ===== Routes =====
 
 @app.get("/ping")
@@ -367,8 +286,8 @@ def health():
         "version": APP_VER,
         "sender": SENDER_DEFAULT,
         "smtp_user": SMTP_USER,
-        "imap_user": IMAP_USER,
-        "sendgrid": bool(sg)
+        "sendgrid": bool(sg),
+        "inbound": "sendgrid"  # IMAP 제거, SendGrid Inbound Parse 사용
     }
 
 @app.get("/status")
@@ -382,11 +301,11 @@ def status(token: Optional[str] = Query(None), request: Request = None):
         "version": APP_VER,
         "messages": cnt,
         "smtp_user": SMTP_USER,
-        "imap_user": IMAP_USER,
         "sendgrid": bool(sg),
+        "inbound": "sendgrid"
     }
 
-# === NEW: /tool/send - GPT Tool용 간단 발송 ===
+# === /tool/send - GPT Tool용 간단 발송 ===
 @app.post("/tool/send")
 def tool_send(payload: ToolSendReq, token: Optional[str] = Query(None), request: Request = None):
     require_token(token, request)
@@ -444,7 +363,7 @@ async def inbound(
     print(f"[INBOUND] stored id={msg_id} from={from_field}")
     return {"ok": True, "id": msg_id, "assistant": assist_res, "alert_class": aclass, "importance": importance}
 
-# === NEW: /inbound/sen - SendGrid Inbound Parse용 ===
+# === /inbound/sen - SendGrid Inbound Parse용 ===
 @app.post("/inbound/sen")
 async def inbound_sen(
     request: Request,
@@ -454,13 +373,23 @@ async def inbound_sen(
     subject: str = Form(""),
     text: str = Form(""),
     html: Optional[str] = Form(None),
+    attachments: Optional[List[UploadFile]] = File(None),  # SendGrid도 첨부파일 지원
 ):
     if not INBOUND_TOKEN or token != INBOUND_TOKEN:
         raise HTTPException(status_code=401, detail="invalid inbound token")
     
-    # SendGrid는 from/to가 없을 수도 있으므로 기본값 처리
     from_field = from_field or "unknown@sendgrid.com"
     to = to or SENDER_DEFAULT
+
+    # 첨부파일 처리
+    atts = []
+    if attachments:
+        for f in attachments:
+            atts.append({
+                "filename": f.filename,
+                "content_b64": b64_of_upload(f),
+                "content_type": f.content_type or "application/octet-stream"
+            })
 
     aclass, importance = simple_alert_parse(subject, text)
 
@@ -469,7 +398,7 @@ async def inbound_sen(
     conn.execute("""
         INSERT INTO messages(sender, recipients, subject, text, html, attachments_json, created_at, alert_class, importance)
         VALUES(?,?,?,?,?,?,?,?,?)
-    """, (from_field, to, subject, text, html, "[]", now, aclass, importance))
+    """, (from_field, to, subject, text, html, json.dumps(atts), now, aclass, importance))
     msg_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
     conn.commit()
     conn.close()
@@ -479,7 +408,7 @@ async def inbound_sen(
     if importance >= ALERT_IMPORTANCE_MIN:
         telegram_notify(f"[{aclass or 'INFO'}] {subject}\nfrom {from_field}\n#{msg_id}")
 
-    print(f"[INBOUND-SEN] stored id={msg_id} from={from_field}")
+    print(f"[INBOUND-SEN] stored id={msg_id} from={from_field} attachments={len(atts)}")
     return {"ok": True, "id": msg_id, "assistant": assist_res, "alert_class": aclass, "importance": importance}
 
 # === Send ===
@@ -618,8 +547,14 @@ def mail_delete(body: DeleteRequest, token: Optional[str] = Query(None), request
     print(f"[DELETE] id={body.id}")
     return {"ok": True, "id": body.id}
 
+# === IMAP 대신 SendGrid 사용 안내 ===
 @app.post("/mail/poll-now")
 def mail_poll_now(token: Optional[str] = Query(None), request: Request = None):
     require_token(token, request)
-    stored = imap_poll(limit=20)
-    return {"ok": True, "stored": stored}
+    # IMAP 폴링 대신 SendGrid Inbound Parse 사용 안내
+    print("[POLL-NOW] Using SendGrid Inbound Parse - no polling needed")
+    return {
+        "ok": True,
+        "stored": 0,
+        "message": "Using SendGrid Inbound Parse webhook - emails are received automatically"
+    }
