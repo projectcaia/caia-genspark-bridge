@@ -29,14 +29,11 @@ def auto_delete(ttl_days: int = 7):
     conn = get_db()
     cur = conn.cursor()
     cutoff = datetime.utcnow() - timedelta(days=ttl_days)
-    cur.execute(
-        "SELECT id, subject FROM messages WHERE deleted=0 AND priority='low' AND created_at < ?",
-        (cutoff.isoformat(),),
-    )
+    cur.execute("SELECT id, subject FROM mails WHERE deleted=0 AND priority='low' AND created_at < ?", (cutoff.isoformat(),))
     rows = cur.fetchall()
     deleted_count = 0
     for row in rows:
-        cur.execute("UPDATE messages SET deleted=1 WHERE id=?", (row["id"],))
+        cur.execute("UPDATE mails SET deleted=1 WHERE id=?", (row["id"],))
         deleted_count += 1
     conn.commit()
     # Only notify if bulk deletion
@@ -46,12 +43,12 @@ def auto_delete(ttl_days: int = 7):
 def auto_reply():
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT id, sender, subject FROM messages WHERE replied=0 AND auto_reply=1")
+    cur.execute("SELECT id, from_, subject FROM mails WHERE replied=0 AND auto_reply=1")
     rows = cur.fetchall()
     for row in rows:
         try:
             # simulate reply send
-            cur.execute("UPDATE messages SET replied=1 WHERE id=?", (row["id"],))
+            cur.execute("UPDATE mails SET replied=1 WHERE id=?", (row["id"],))
         except Exception as e:
             notify_telegram("자동답장 실패", f"메일 ID {row['id']} ({row['subject']}) 답장 실패: {e}")
     conn.commit()
@@ -59,12 +56,7 @@ def auto_reply():
 def report_high_priority():
     conn = get_db()
     cur = conn.cursor()
-    cur.execute(
-        "SELECT id, sender, subject FROM messages WHERE priority='high' AND deleted=0"
-    )
+    cur.execute("SELECT id, from_, subject FROM mails WHERE priority='high' AND deleted=0")
     rows = cur.fetchall()
     for row in rows:
-        notify_telegram(
-            "중요 메일 도착",
-            f"{row['subject']} from {row['sender']} (ID {row['id']})",
-        )
+        notify_telegram("중요 메일 도착", f"{row['subject']} from {row['from_']} (ID {row['id']})")
