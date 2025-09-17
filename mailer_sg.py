@@ -87,7 +87,6 @@ async def send_email_sg(
 
     # 첨부 (content_b64 필수)
     if attachments_b64:
-        atts = []
         for att in attachments_b64:
             content_b64 = att.get("content_b64") or att.get("content")  # 호환 키
             if not content_b64:
@@ -95,7 +94,7 @@ async def send_email_sg(
             # 이미 b64라면 그대로, raw bytes가 온 경우 b64로 인코딩
             if isinstance(content_b64, (bytes, bytearray)):
                 content_b64 = base64.b64encode(content_b64).decode()
-            atts.append(
+            msg.add_attachment(
                 Attachment(
                     FileContent(content_b64),
                     FileName(att.get("filename", "attachment.bin")),
@@ -103,8 +102,6 @@ async def send_email_sg(
                     Disposition("attachment"),
                 )
             )
-        if atts:
-            msg.attachments = atts
 
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _send_blocking, msg, retries, backoff)
