@@ -207,7 +207,6 @@ class DeleteRequest(BaseModel):
     id: int
 
 # ===== Send Functions =====
- getattr(resp, "status_code", None)
 
 def send_email(payload: SendMailPayload):
     if not sg:
