@@ -918,10 +918,11 @@ def mail_attach(id: int = Query(...), idx: int = Query(...), token: Optional[str
 def test_send_email_get(
     to: str = Query(..., description="수신자 이메일"),
     subject: str = Query("Test Email", description="제목"),
-    token: Optional[str] = Query(None)
+    token: Optional[str] = Query(None),
+    request: Request = None  # Request 객체 추가
 ):
     """GET 방식 간단 메일 발송 테스트"""
-    require_token(token, None)
+    require_token(token, request)  # request 전달
     
     print(f"[TEST-SEND-EMAIL] GET request to={to} subject={subject}")
     
