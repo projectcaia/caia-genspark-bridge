@@ -207,7 +207,55 @@ class DeleteRequest(BaseModel):
     id: int
 
 # ===== Send Functions =====
- getattr(resp, "status_code", None)
+
+
+def send_via_sendgrid(payload: SendMailPayload):
+    if not sg:
+        raise RuntimeError("SendGrid not configured")
+
+    try:
+        to_list = [To(str(addr)) for addr in (payload.to or []) if addr]
+        if not to_list:
+            raise ValueError("At least one recipient is required")
+
+        msg = Mail(
+            from_email=Email(str(payload.from_ or SENDER_DEFAULT)),
+            to_emails=to_list,
+            subject=payload.subject,
+            plain_text_content=payload.text or "",
+            html_content=payload.html or None,
+        )
+
+        if payload.cc:
+            msg.cc = [Cc(str(addr)) for addr in payload.cc if addr]
+        if payload.bcc:
+            msg.bcc = [Bcc(str(addr)) for addr in payload.bcc if addr]
+        if payload.reply_to:
+            msg.reply_to = Email(str(payload.reply_to))
+
+        attachments = []
+        if payload.attachments_b64:
+            for att in payload.attachments_b64:
+                content = att.content_b64
+                if not content:
+                    continue
+                attachments.append(
+                    Attachment(
+                        file_content=content,
+                        file_type=att.content_type or "application/octet-stream",
+                        file_name=att.filename,
+                        disposition="attachment",
+                    )
+                )
+        if attachments:
+            msg.attachments = attachments
+
+        resp = sg.send(msg)
+        return getattr(resp, "status_code", None)
+    except Exception as exc:
+        print(f"[SendGrid SEND ERROR] {exc}")
+        raise
+
 
 def send_email(payload: SendMailPayload):
     if not sg:
