@@ -353,7 +353,7 @@ async def execute_action(action: dict, original_sender: str) -> dict:
                 to=to_list,
                 subject=action.get("subject", "카이아 자동 발송"),
                 text=action.get("content", ""),
-                from_=EmailStr("caia@caia-agent.com")
+                from_="caia@caia-agent.com"
             )
             
             result = send_email(payload)
@@ -375,10 +375,10 @@ async def execute_action(action: dict, original_sender: str) -> dict:
             content = action.get("content", "")
             # 동현에게 보고
             payload = SendMailPayload(
-                to=[EmailStr("flyartnam@gmail.com")],
+                to=["flyartnam@gmail.com"],
                 subject="[카이아 보고서] 자동 생성",
                 text=content,
-                from_=EmailStr("caia@caia-agent.com")
+                from_="caia@caia-agent.com"
             )
             send_email(payload)
             return {"success": True, "type": "report_created"}
@@ -739,10 +739,10 @@ async def inbound_sen_intelligent(
         reply_text = generate_intelligent_reply(analysis, text, subject, assistant_result)
         if reply_text:
             auto_reply_payload = SendMailPayload(
-                to=[EmailStr(from_field)],
+                to=[from_field],
                 subject=f"Re: {subject}",
                 text=reply_text,
-                from_=EmailStr("caia@caia-agent.com")
+                from_="caia@caia-agent.com"
             )
             try:
                 send_email(auto_reply_payload)
@@ -803,10 +803,10 @@ Type: {analysis['mail_type']}"""
 필요 조치: {', '.join(analysis['actions'])}"""
             
             forward_payload = SendMailPayload(
-                to=[EmailStr("flyartnam@gmail.com")],
+                to=["flyartnam@gmail.com"],
                 subject=f"[에이전트 보고] {subject}",
                 text=summary,
-                from_=EmailStr("caia@caia-agent.com")
+                from_="caia@caia-agent.com"
             )
             try:
                 send_email(forward_payload)
@@ -931,7 +931,7 @@ def test_send_email_get(
         to=[to],  # 리스트로 변환
         subject=subject,
         text=f"Test email sent via GET method at {dt.datetime.now()}",
-        from_=EmailStr("caia@caia-agent.com")
+        from_="caia@caia-agent.com"
     )
     
     try:
