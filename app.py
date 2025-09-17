@@ -913,7 +913,34 @@ def mail_attach(id: int = Query(...), idx: int = Query(...), token: Optional[str
             "Content-Disposition": f'attachment; filename="{att.get("filename", "file")}"'
         }
     )
-
+    
+@app.get("/test/send-email")
+def test_send_email_get(
+    to: str = Query(..., description="수신자 이메일"),
+    subject: str = Query("Test Email", description="제목"),
+    token: Optional[str] = Query(None)
+):
+    """GET 방식 간단 메일 발송 테스트"""
+    require_token(token, None)
+    
+    print(f"[TEST-SEND-EMAIL] GET request to={to} subject={subject}")
+    
+    # SendGrid로 발송
+    payload = SendMailPayload(
+        to=[to],  # 리스트로 변환
+        subject=subject,
+        text=f"Test email sent via GET method at {dt.datetime.now()}",
+        from_=EmailStr("caia@caia-agent.com")
+    )
+    
+    try:
+        res = send_email(payload)
+        print(f"[TEST-SEND-EMAIL] Success: {res}")
+        return {"ok": True, "sent_to": to, "subject": subject, **res}
+    except Exception as e:
+        print(f"[TEST-SEND-EMAIL] Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+        
 @app.get("/dashboard/summary")
 def dashboard_summary(token: Optional[str] = Query(None), request: Request = None):
     require_token(token, request)
