@@ -9,8 +9,6 @@ import datetime as dt
 from typing import List, Optional
 
 import requests
-import smtplib
-from email.message import EmailMessage
 
 from fastapi import FastAPI, Request, UploadFile, Form, File, Query, HTTPException
 from fastapi.responses import StreamingResponse
@@ -63,14 +61,8 @@ ASSISTANT_ID = os.getenv("ASSISTANT_ID", "")
 THREAD_ID = os.getenv("THREAD_ID", "")
 AUTO_RUN = os.getenv("AUTO_RUN", "false").lower() in ("1","true","yes")
 
-# SMTP (Zoho) - 발신 전용
-SMTP_HOST = os.getenv("SMTP_HOST", "smtp.zoho.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
-SMTP_USER = os.getenv("SMTP_USER", "")
-SMTP_PASS = env_get(["ZOHO_SMTP_PASSWORD", "SMTP_PASSWORD"], "")
-SMTP_SSL = os.getenv("SMTP_SSL", "true").lower() in ("1","true","yes")
-
 # SendGrid
+
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "")
 sg = SendGridAPIClient(api_key=SENDGRID_API_KEY) if (SENDGRID_API_KEY and SendGridAPIClient) else None
 
@@ -215,67 +207,7 @@ class DeleteRequest(BaseModel):
     id: int
 
 # ===== Send Functions =====
-def send_via_smtp(payload: SendMailPayload):
-    msg = EmailMessage()
-    msg["From"] = payload.from_ or SENDER_DEFAULT
-    msg["To"] = ", ".join(payload.to)
-    msg["Subject"] = payload.subject
-    if payload.cc:
-        msg["Cc"] = ", ".join(payload.cc)
-    if payload.reply_to:
-        msg["Reply-To"] = str(payload.reply_to)
-    msg.set_content(payload.text or "")
-    if payload.html:
-        msg.add_alternative(payload.html, subtype="html")
-    if payload.attachments_b64:
-        for a in payload.attachments_b64:
-            raw = base64.b64decode(a.content_b64)
-            ctype = a.content_type or "application/octet-stream"
-            maintype, subtype = (ctype.split("/", 1) if "/" in ctype else ("application","octet-stream"))
-            msg.add_attachment(raw, maintype=maintype, subtype=subtype, filename=a.filename)
-
-    print(f"[SMTP] host={SMTP_HOST} port={SMTP_PORT} ssl={SMTP_SSL} user={SMTP_USER}")
-    try:
-        if SMTP_SSL:
-            ctx = ssl.create_default_context()
-            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ctx) as s:
-                s.login(SMTP_USER, SMTP_PASS)
-                s.send_message(msg)
-        else:
-            with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
-                s.starttls()
-                s.login(SMTP_USER, SMTP_PASS)
-                s.send_message(msg)
-        print("[SMTP] send OK")
-    except Exception as e:
-        print("[SMTP ERROR]", e)
-        raise
-
-def send_via_sendgrid(payload: SendMailPayload):
-    if not sg:
-        raise RuntimeError("SendGrid not configured")
-    print("[SendGrid] sending via API")
-    message = Mail(
-        from_email=Email((payload.from_ or SENDER_DEFAULT)),
-        to_emails=[To(addr) for addr in payload.to],
-        subject=payload.subject,
-        plain_text_content=Content("text/plain", payload.text or ""),
-        html_content=Content("text/html", payload.html or (payload.text or "")),
-    )
-    if payload.cc: message.cc = [Cc(addr) for addr in payload.cc]
-    if payload.bcc: message.bcc = [Bcc(addr) for addr in payload.bcc]
-    if payload.reply_to: message.reply_to = Email(str(payload.reply_to))
-    if payload.attachments_b64:
-        att_objs = []
-        for a in payload.attachments_b64:
-            att = Attachment()
-            att.file_content = a.content_b64
-            att.file_name = a.filename
-            att_objs.append(att)
-        message.attachment = att_objs
-    resp = sg.send(message)
-    print("[SendGrid] status:", getattr(resp, "status_code", None))
-    return getattr(resp, "status_code", None)
+ getattr(resp, "status_code", None)
 
 def send_email(payload: SendMailPayload):
     if not sg:
@@ -299,7 +231,7 @@ def health():
         "ok": True,
         "version": APP_VER,
         "sender": SENDER_DEFAULT,
-        "smtp_user": None,
+        
         "sendgrid": bool(sg),
         "inbound": "sendgrid"  # IMAP 제거, SendGrid Inbound Parse 사용
     }
@@ -314,7 +246,7 @@ def status(token: Optional[str] = Query(None), request: Request = None):
         "ok": True,
         "version": APP_VER,
         "messages": cnt,
-        "smtp_user": None,
+        
         "sendgrid": bool(sg),
         "inbound": "sendgrid"
     }
@@ -348,11 +280,11 @@ async def inbound(
     if not INBOUND_TOKEN or token != INBOUND_TOKEN:
         raise HTTPException(status_code=401, detail="invalid inbound token")
 
-        # Fallback: if no text but html exists, generate text from html
+    # Fallback: if no text but html exists, generate text from html
     if not text and html:
         text = html_to_text(html)
 
-atts = []
+    atts = []
     if attachments:
         for f in attachments:
             atts.append({
@@ -391,20 +323,19 @@ async def inbound_sen(
     subject: str = Form(""),
     text: str = Form(""),
     html: Optional[str] = Form(None),
-    attachments: Optional[List[UploadFile]] = File(None),  # SendGrid도 첨부파일 지원
+    attachments: Optional[List[UploadFile]] = File(None),
 ):
     if not INBOUND_TOKEN or token != INBOUND_TOKEN:
         raise HTTPException(status_code=401, detail="invalid inbound token")
-    
+
     from_field = from_field or "unknown@sendgrid.com"
     to = to or SENDER_DEFAULT
 
-    # 첨부파일 처리
-        # Fallback: if no text but html exists, generate text from html
+    # Fallback: if no text but html exists, generate text from html
     if not text and html:
         text = html_to_text(html)
 
-atts = []
+    atts = []
     if attachments:
         for f in attachments:
             atts.append({
