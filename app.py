@@ -206,7 +206,48 @@ class ToolSendReq(BaseModel):
 class DeleteRequest(BaseModel):
     id: int
 
+
 # ===== Send Functions =====
+
+def send_via_sendgrid(payload: SendMailPayload) -> int:
+    if not sg:
+        raise RuntimeError("SendGrid client not configured")
+
+    from_email = Email(str(payload.from_ or SENDER_DEFAULT))
+    msg = Mail(from_email=from_email, subject=payload.subject)
+
+    for addr in payload.to:
+        msg.add_to(To(str(addr)))
+
+    if payload.cc:
+        for addr in payload.cc:
+            msg.add_cc(Cc(str(addr)))
+
+    if payload.bcc:
+        for addr in payload.bcc:
+            msg.add_bcc(Bcc(str(addr)))
+
+    if payload.reply_to:
+        msg.reply_to = Email(str(payload.reply_to))
+
+    if payload.text is not None:
+        msg.add_content(Content("text/plain", payload.text))
+
+    if payload.html is not None:
+        msg.add_content(Content("text/html", payload.html))
+
+    if payload.attachments_b64:
+        for att in payload.attachments_b64:
+            attachment = Attachment()
+            attachment.file_content = att.content_b64
+            attachment.file_name = att.filename
+            attachment.file_type = att.content_type or "application/octet-stream"
+            attachment.disposition = "attachment"
+            msg.add_attachment(attachment)
+
+    resp = sg.send(msg)
+    return int(resp.status_code)
+
 
 def send_email(payload: SendMailPayload):
     if not sg:
