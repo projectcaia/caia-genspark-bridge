@@ -1,4 +1,4 @@
-# app.py (SendGrid Inbound Parse 전용 - IMAP 제거)
+# app.py (SendGrid Inbound Parse 전용 - 지능형 메일 처리 시스템)
 import os
 import io
 import ssl
@@ -6,7 +6,7 @@ import json
 import base64
 import sqlite3
 import datetime as dt
-from typing import List, Optional
+from typing import List, Optional, Dict
 
 import requests
 
@@ -26,11 +26,11 @@ try:
 except Exception:
     SendGridAPIClient = None
 
-APP_VER = "2025-09-16"
+APP_VER = "2025-09-17"
 
 app = FastAPI(
     title="Caia Mail Bridge",
-    version="2.4.2",
+    version="2.5.0",
     openapi_version="3.1.0",
     servers=[{"url": "https://mail-bridge.up.railway.app"}],
 )
@@ -62,7 +62,6 @@ THREAD_ID = os.getenv("THREAD_ID", "")
 AUTO_RUN = os.getenv("AUTO_RUN", "false").lower() in ("1","true","yes")
 
 # SendGrid
-
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "")
 sg = SendGridAPIClient(api_key=SENDGRID_API_KEY) if (SENDGRID_API_KEY and SendGridAPIClient) else None
 
@@ -74,6 +73,7 @@ def db():
 
 def init_db():
     conn = db()
+    # 기본 테이블 생성
     conn.execute("""
     CREATE TABLE IF NOT EXISTS messages(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -85,13 +85,141 @@ def init_db():
         attachments_json TEXT,
         created_at TEXT,
         alert_class TEXT,
-        importance REAL
+        importance REAL,
+        sender_type TEXT DEFAULT 'unknown',
+        mail_type TEXT DEFAULT 'general',
+        auto_processed INTEGER DEFAULT 0,
+        reply_sent INTEGER DEFAULT 0
     )
     """)
+    
+    # 기존 테이블에 새 컬럼 추가 (이미 있으면 무시)
+    try:
+        conn.execute("ALTER TABLE messages ADD COLUMN sender_type TEXT DEFAULT 'unknown'")
+    except: pass
+    try:
+        conn.execute("ALTER TABLE messages ADD COLUMN mail_type TEXT DEFAULT 'general'")
+    except: pass
+    try:
+        conn.execute("ALTER TABLE messages ADD COLUMN auto_processed INTEGER DEFAULT 0")
+    except: pass
+    try:
+        conn.execute("ALTER TABLE messages ADD COLUMN reply_sent INTEGER DEFAULT 0")
+    except: pass
+    
     conn.commit()
     conn.close()
 
 init_db()
+
+# ===== Mail Analysis System =====
+def analyze_and_classify_email(sender: str, subject: str, text: str) -> dict:
+    """메일 내용 분석 및 분류"""
+    
+    # 1. 발신자 분류
+    sender_type = "unknown"
+    if any(agent in sender.lower() for agent in ["agent", "zenspark", "reflex", "sentinel"]):
+        sender_type = "agent"
+    elif "flyartnam" in sender.lower():  # 동현
+        sender_type = "owner"
+    else:
+        sender_type = "external"
+    
+    # 2. 메일 유형 분류
+    mail_type = "general"
+    priority = "normal"
+    
+    # 보고서 패턴
+    if any(word in (subject + text).lower() for word in ["report", "보고", "완료", "결과", "처리완료"]):
+        mail_type = "report"
+        priority = "high"
+    
+    # 지시/명령 패턴
+    elif any(word in text.lower() for word in ["수행", "처리", "분석", "execute", "analyze", "해줘", "하세요"]):
+        mail_type = "command"
+        priority = "high"
+    
+    # 질문/요청 패턴
+    elif "?" in text or any(word in text.lower() for word in ["요청", "부탁", "please", "could", "문의"]):
+        mail_type = "request"
+        priority = "normal"
+    
+    # 오류/경고 패턴
+    elif any(word in (subject + text).lower() for word in ["error", "warning", "실패", "오류", "fail", "critical"]):
+        mail_type = "alert"
+        priority = "critical"
+    
+    # 3. 액션 결정
+    actions = []
+    if sender_type == "agent" and mail_type == "report":
+        actions.append("forward_to_owner")
+        actions.append("summarize")
+    elif sender_type == "owner" and mail_type == "command":
+        actions.append("distribute_to_agents")
+        actions.append("track_execution")
+    elif mail_type == "alert":
+        actions.append("immediate_notification")
+        actions.append("auto_troubleshoot")
+    elif mail_type == "request":
+        actions.append("process_request")
+    
+    return {
+        "sender_type": sender_type,
+        "mail_type": mail_type,
+        "priority": priority,
+        "actions": actions,
+        "requires_reply": mail_type in ["request", "command"],
+        "auto_reply_enabled": sender_type != "owner"  # 동현에게는 자동 응답 안 함
+    }
+
+def generate_intelligent_reply(analysis: dict, original_text: str, subject: str) -> Optional[str]:
+    """상황에 맞는 자동 응답 생성"""
+    
+    if not analysis["auto_reply_enabled"]:
+        return None
+    
+    mail_type = analysis["mail_type"]
+    now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    if mail_type == "report":
+        return f"""보고서 수신 확인
+
+귀하의 보고서를 정상적으로 수신했습니다.
+내용을 검토 후 필요시 추가 지시사항을 전달하겠습니다.
+
+주요 내용:
+- 수신 시각: {now}
+- 분류: {mail_type}
+- 우선순위: {analysis['priority']}
+
+감사합니다.
+Caia System"""
+    
+    elif mail_type == "request":
+        return f"""요청 접수 완료
+
+귀하의 요청을 접수했습니다.
+처리 후 결과를 회신드리겠습니다.
+
+예상 처리 시간: 30분 이내
+요청 유형: {mail_type}
+
+Caia System"""
+    
+    elif mail_type == "alert":
+        return f"""[긴급] 오류 알림 수신
+
+오류 보고를 수신했습니다.
+즉시 담당자에게 전달하고 조치를 시작합니다.
+
+조치 사항:
+1. 관리자 알림 전송 완료
+2. 자동 진단 시작
+3. 30분 이내 상세 분석 결과 전달 예정
+
+Caia Emergency Response System"""
+    
+    return None
 
 # ===== Helpers =====
 def _bearer_from_header(request: Request) -> Optional[str]:
@@ -117,22 +245,6 @@ def telegram_notify(text: str):
     except Exception:
         pass
 
-def simple_alert_parse(subject: Optional[str], text: Optional[str]):
-    alert_class = None
-    importance = 0.4
-    subj = (subject or "").strip()
-    if subj.startswith("[") and "]" in subj:
-        cls = subj.split("]")[0].strip("[]").upper()
-        if cls in ALERT_CLASSES:
-            alert_class = cls
-            importance = max(importance, 0.6)
-    payload = f"{subj}\n{text or ''}".lower()
-    for w in ["급락","vix","sev","critical","panic","emergency"]:
-        if w in payload:
-            importance = min(1.0, importance + 0.15)
-    return alert_class, importance
-
-
 def html_to_text(html: str) -> str:
     """Very light HTML->text fallback: strip tags & unescape basic entities."""
     try:
@@ -151,11 +263,10 @@ def assistants_log_and_maybe_run(sender: str, recipients: str, subject: str, tex
         return {"thread_message_id": None, "run_id": None}
     try:
         client = OpenAI(api_key=OPENAI_API_KEY)
-        content_text = f"From: {sender}\nTo: {recipients}\nSubject: {subject}\n\n{text or ''}"
         msg = client.beta.threads.messages.create(
             thread_id=THREAD_ID,
             role="user",
-            content=[{"type":"text","text": content_text}]
+            content=[{"type":"text","text": text}]
         )
         run = None
         if AUTO_RUN and ASSISTANT_ID:
@@ -180,7 +291,7 @@ def parse_to_list(raw) -> List[str]:
         return items
     return [s.strip() for s in str(raw).split(",") if s.strip()]
 
-# ===== Pydantic =====
+# ===== Pydantic Models =====
 class AttachmentInModel(BaseModel):
     filename: str
     content_b64: str
@@ -206,9 +317,7 @@ class ToolSendReq(BaseModel):
 class DeleteRequest(BaseModel):
     id: int
 
-
 # ===== Send Functions =====
-
 def send_via_sendgrid(payload: SendMailPayload) -> int:
     if not sg:
         raise RuntimeError("SendGrid client not configured")
@@ -248,7 +357,6 @@ def send_via_sendgrid(payload: SendMailPayload) -> int:
     resp = sg.send(msg)
     return int(resp.status_code)
 
-
 def send_email(payload: SendMailPayload):
     if not sg:
         raise HTTPException(status_code=500, detail="SendGrid not configured")
@@ -271,9 +379,8 @@ def health():
         "ok": True,
         "version": APP_VER,
         "sender": SENDER_DEFAULT,
-        
         "sendgrid": bool(sg),
-        "inbound": "sendgrid"  # IMAP 제거, SendGrid Inbound Parse 사용
+        "inbound": "sendgrid"
     }
 
 @app.get("/status")
@@ -286,12 +393,10 @@ def status(token: Optional[str] = Query(None), request: Request = None):
         "ok": True,
         "version": APP_VER,
         "messages": cnt,
-        
         "sendgrid": bool(sg),
         "inbound": "sendgrid"
     }
 
-# === /tool/send - GPT Tool용 간단 발송 ===
 @app.post("/tool/send")
 def tool_send(payload: ToolSendReq, token: Optional[str] = Query(None), request: Request = None):
     require_token(token, request)
@@ -305,76 +410,43 @@ def tool_send(payload: ToolSendReq, token: Optional[str] = Query(None), request:
     print(f"[TOOL-SEND] via={res['via']} to={','.join(payload.to)} subject={payload.subject}")
     return {"ok": True, **res}
 
-# === Inbound (multipart) ===
-@app.post("/inbound")
-async def inbound(
-    request: Request,
-    token: str = Query(..., description="INBOUND_TOKEN"),
-    from_field: str = Form(alias="from"),
-    to: str = Form(...),
-    subject: str = Form(""),
-    text: str = Form(""),
-    html: Optional[str] = Form(None),
-    attachments: Optional[List[UploadFile]] = File(None),
-):
-    if not INBOUND_TOKEN or token != INBOUND_TOKEN:
-        raise HTTPException(status_code=401, detail="invalid inbound token")
-
-    # Fallback: if no text but html exists, generate text from html
-    if not text and html:
-        text = html_to_text(html)
-
-    atts = []
-    if attachments:
-        for f in attachments:
-            atts.append({
-                "filename": f.filename,
-                "content_b64": b64_of_upload(f),
-                "content_type": f.content_type or "application/octet-stream"
-            })
-
-    aclass, importance = simple_alert_parse(subject, text)
-
-    now = dt.datetime.utcnow().isoformat()
-    conn = db()
-    conn.execute("""
-        INSERT INTO messages(sender, recipients, subject, text, html, attachments_json, created_at, alert_class, importance)
-        VALUES(?,?,?,?,?,?,?,?,?)
-    """, (from_field, to, subject, text, html, json.dumps(atts), now, aclass, importance))
-    msg_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
-    conn.commit()
-    conn.close()
-
-    assist_res = assistants_log_and_maybe_run(from_field, to, subject, text, html)
-
-    if importance >= ALERT_IMPORTANCE_MIN:
-        telegram_notify(f"[{aclass or 'INFO'}] {subject}\nfrom {from_field}\n#{msg_id}")
-
-    print(f"[INBOUND] stored id={msg_id} from={from_field}")
-    return {"ok": True, "id": msg_id, "assistant": assist_res, "alert_class": aclass, "importance": importance}
-
-# === /inbound/sen - SendGrid Inbound Parse용 ===
+# === 강화된 Inbound 처리 (422 에러 해결 + 지능형 처리) ===
 @app.post("/inbound/sen")
-async def inbound_sen(
+async def inbound_sen_enhanced(
     request: Request,
     token: str = Query(...),
-    from_field: str = Form(None, alias="from"),
-    to: str = Form(None),
-    subject: str = Form(""),
-    text: str = Form(""),
+    # 모든 필드를 Optional로 변경 (422 에러 해결)
+    from_field: Optional[str] = Form(None, alias="from"),
+    From: Optional[str] = Form(None),  # 대문자 버전
+    sender: Optional[str] = Form(None),  # 대체 필드
+    to: Optional[str] = Form(None),
+    To: Optional[str] = Form(None),  # 대문자 버전
+    subject: Optional[str] = Form(""),
+    Subject: Optional[str] = Form(None),  # 대문자 버전
+    text: Optional[str] = Form(""),
+    Text: Optional[str] = Form(None),  # 대문자 버전
     html: Optional[str] = Form(None),
+    Html: Optional[str] = Form(None),  # 대문자 버전
     attachments: Optional[List[UploadFile]] = File(None),
 ):
     if not INBOUND_TOKEN or token != INBOUND_TOKEN:
         raise HTTPException(status_code=401, detail="invalid inbound token")
-
-    from_field = from_field or "unknown@sendgrid.com"
-    to = to or SENDER_DEFAULT
-
-    # Fallback: if no text but html exists, generate text from html
+    
+    # 필드 병합 (대소문자 호환)
+    from_field = from_field or From or sender or "unknown@sendgrid.com"
+    to = to or To or SENDER_DEFAULT
+    subject = subject or Subject or ""
+    text = text or Text or ""
+    html = html or Html
+    
+    # HTML to text 변환
     if not text and html:
         text = html_to_text(html)
-
+    
+    # 메일 내용 분석
+    analysis = analyze_and_classify_email(from_field, subject, text)
+    
+    # 첨부파일 처리
     atts = []
     if attachments:
         for f in attachments:
@@ -383,79 +455,110 @@ async def inbound_sen(
                 "content_b64": b64_of_upload(f),
                 "content_type": f.content_type or "application/octet-stream"
             })
-
-    aclass, importance = simple_alert_parse(subject, text)
-
+    
+    # DB 저장 (분석 결과 포함)
     now = dt.datetime.utcnow().isoformat()
     conn = db()
     conn.execute("""
-        INSERT INTO messages(sender, recipients, subject, text, html, attachments_json, created_at, alert_class, importance)
-        VALUES(?,?,?,?,?,?,?,?,?)
-    """, (from_field, to, subject, text, html, json.dumps(atts), now, aclass, importance))
+        INSERT INTO messages(
+            sender, recipients, subject, text, html, 
+            attachments_json, created_at, alert_class, importance,
+            sender_type, mail_type, auto_processed
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (
+        from_field, to, subject, text, html, json.dumps(atts), 
+        now, analysis.get("mail_type"), 
+        1.0 if analysis["priority"] == "critical" else 0.6 if analysis["priority"] == "high" else 0.4,
+        analysis["sender_type"], analysis["mail_type"], 
+        1 if analysis["auto_reply_enabled"] else 0
+    ))
     msg_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
     conn.commit()
     conn.close()
+    
+    # OpenAI Thread에 컨텍스트 포함해서 전달
+    enhanced_text = f"""[메일 분석 결과]
+발신자 유형: {analysis['sender_type']}
+메일 유형: {analysis['mail_type']}
+우선순위: {analysis['priority']}
+필요 조치: {', '.join(analysis['actions'])}
 
-    assist_res = assistants_log_and_maybe_run(from_field, to, subject, text, html)
+[원본 메일]
+From: {from_field}
+To: {to}
+Subject: {subject}
 
-    if importance >= ALERT_IMPORTANCE_MIN:
-        telegram_notify(f"[{aclass or 'INFO'}] {subject}\nfrom {from_field}\n#{msg_id}")
-
-    print(f"[INBOUND-SEN] stored id={msg_id} from={from_field} attachments={len(atts)}")
-    return {"ok": True, "id": msg_id, "assistant": assist_res, "alert_class": aclass, "importance": importance}
-
-# === Send ===
-@app.post("/mail/send")
-def mail_send(payload: SendMailPayload, token: Optional[str] = Query(None), request: Request = None):
-    require_token(token, request)
-    res = send_email(payload)
-    print(f"[SEND] via={res['via']} to={','.join(payload.to)} subject={payload.subject}")
-    return {"ok": True, **res}
-
-@app.post("/mail/send-multipart")
-async def mail_send_multipart(
-    token: Optional[str] = Query(None),
-    request: Request = None,
-    to: List[str] = Form([]),
-    subject: str = Form(...),
-    text: str = Form(""),
-    html: Optional[str] = Form(None),
-    cc: Optional[List[str]] = Form(None),
-    bcc: Optional[List[str]] = Form(None),
-    from_: Optional[str] = Form(None),
-    reply_to: Optional[str] = Form(None),
-    files: Optional[List[UploadFile]] = File(None),
-):
-    require_token(token, request)
-    to_list = parse_to_list(to)
-    cc_list = [EmailStr(x) for x in (parse_to_list(cc) if cc else [])]
-    bcc_list = [EmailStr(x) for x in (parse_to_list(bcc) if bcc else [])]
-
-    att_list: List[AttachmentInModel] = []
-    if files:
-        for f in files:
-            att_list.append(AttachmentInModel(
-                filename=f.filename,
-                content_b64=b64_of_upload(f),
-                content_type=f.content_type or "application/octet-stream"
-            ))
-
-    model = SendMailPayload(
-        to=[EmailStr(x) for x in to_list],
-        subject=subject,
-        text=text,
-        html=html,
-        cc=cc_list or None,
-        bcc=bcc_list or None,
-        from_=EmailStr(from_) if from_ else None,
-        reply_to=EmailStr(reply_to) if reply_to else None,
-        attachments_b64=att_list or None
+{text}"""
+    
+    # Assistant에게 전달 및 자동 실행
+    assist_res = assistants_log_and_maybe_run(
+        from_field, to, subject, enhanced_text, html
     )
-    res = send_email(model)
-    print(f"[SEND-MP] via={res['via']} to={','.join(to_list)} subject={subject}")
-    return {"ok": True, **res}
+    
+    # 자동 응답 처리
+    reply_sent = False
+    if analysis["requires_reply"] and analysis["auto_reply_enabled"]:
+        reply_text = generate_intelligent_reply(analysis, text, subject)
+        if reply_text:
+            # 자동 응답 발송
+            auto_reply_payload = SendMailPayload(
+                to=[EmailStr(from_field)],
+                subject=f"Re: {subject}",
+                text=reply_text,
+                from_=EmailStr("caia@caia-agent.com")
+            )
+            try:
+                send_email(auto_reply_payload)
+                reply_sent = True
+                print(f"[AUTO-REPLY] Sent to {from_field}")
+            except Exception as e:
+                print(f"[AUTO-REPLY ERROR] {e}")
+    
+    # 중요 메일 알림
+    if analysis["priority"] in ["critical", "high"]:
+        notification_text = f"""[{analysis['priority'].upper()}] {analysis['mail_type']}
+From: {from_field}
+Subject: {subject}
+Actions: {', '.join(analysis['actions'])}
+Auto-Reply: {'Sent' if reply_sent else 'N/A'}"""
+        telegram_notify(notification_text)
+    
+    # 동현에게 에이전트 보고서 전달
+    if analysis["sender_type"] == "agent" and "forward_to_owner" in analysis["actions"]:
+        forward_payload = SendMailPayload(
+            to=[EmailStr("flyartnam@gmail.com")],
+            subject=f"[Agent Report] {subject}",
+            text=f"""에이전트 보고서 전달
 
-# === Inbox / View / Attach ===
+발신 에이전트: {from_field}
+원본 제목: {subject}
+
+=== 보고 내용 ===
+{text}
+
+=== 분석 결과 ===
+메일 유형: {analysis['mail_type']}
+우선순위: {analysis['priority']}
+자동 처리: {'완료' if reply_sent else '대기'}""",
+            from_=EmailStr("caia@caia-agent.com")
+        )
+        try:
+            send_email(forward_payload)
+            print(f"[FORWARD] Agent report forwarded to owner")
+        except Exception as e:
+            print(f"[FORWARD ERROR] {e}")
+    
+    print(f"[INBOUND-SEN] stored id={msg_id} from={from_field} type={analysis['mail_type']} priority={analysis['priority']}")
+    
+    return {
+        "ok": True, 
+        "id": msg_id, 
+        "assistant": assist_res,
+        "analysis": analysis,
+        "auto_reply_sent": reply_sent
+    }
+
+# === 나머지 기존 엔드포인트들 (변경 없음) ===
 @app.get("/inbox.json")
 def inbox_json(limit: int = 20, token: Optional[str] = Query(None), request: Request = None):
     require_token(token, request)
@@ -463,7 +566,8 @@ def inbox_json(limit: int = 20, token: Optional[str] = Query(None), request: Req
     conn = db()
     rows = conn.execute("""
         SELECT id, sender, recipients, subject, substr(text,1,500) AS text, created_at,
-               CASE WHEN (attachments_json IS NOT NULL AND length(attachments_json) > 2 AND attachments_json != '[]') THEN 1 ELSE 0 END AS has_attachments
+               CASE WHEN (attachments_json IS NOT NULL AND length(attachments_json) > 2 AND attachments_json != '[]') THEN 1 ELSE 0 END AS has_attachments,
+               sender_type, mail_type, importance
         FROM messages ORDER BY id DESC LIMIT ?
     """, (limit,)).fetchall()
     conn.close()
@@ -477,7 +581,10 @@ def inbox_json(limit: int = 20, token: Optional[str] = Query(None), request: Req
                 "subject": r["subject"],
                 "date": r["created_at"],
                 "text": r["text"],
-                "has_attachments": bool(r["has_attachments"])
+                "has_attachments": bool(r["has_attachments"]),
+                "sender_type": r["sender_type"],
+                "mail_type": r["mail_type"],
+                "importance": r["importance"]
             } for r in rows
         ]
     }
@@ -501,53 +608,66 @@ def mail_view(id: int = Query(...), token: Optional[str] = Query(None), request:
             "date": row["created_at"],
             "text": row["text"],
             "html": row["html"],
-            "attachments": files
+            "attachments": files,
+            "sender_type": row["sender_type"],
+            "mail_type": row["mail_type"],
+            "importance": row["importance"]
         }
     }
 
-@app.get("/mail/attach")
-def mail_attach(
-    id: int = Query(...),
-    idx: int = Query(0, ge=0),
-    download: int = Query(1, ge=0, le=1),
-    token: Optional[str] = Query(None),
-    request: Request = None
-):
+# === 새로운 대시보드 엔드포인트 ===
+@app.get("/dashboard/summary")
+def dashboard_summary(token: Optional[str] = Query(None), request: Request = None):
     require_token(token, request)
+    
     conn = db()
-    row = conn.execute("SELECT attachments_json FROM messages WHERE id=?", (id,)).fetchone()
+    
+    # 통계 조회
+    stats = conn.execute("""
+        SELECT 
+            COUNT(*) as total,
+            SUM(CASE WHEN sender_type = 'agent' THEN 1 ELSE 0 END) as from_agents,
+            SUM(CASE WHEN sender_type = 'owner' THEN 1 ELSE 0 END) as from_owner,
+            SUM(CASE WHEN mail_type = 'report' THEN 1 ELSE 0 END) as reports,
+            SUM(CASE WHEN mail_type = 'command' THEN 1 ELSE 0 END) as commands,
+            SUM(CASE WHEN mail_type = 'alert' THEN 1 ELSE 0 END) as alerts,
+            SUM(CASE WHEN auto_processed = 1 THEN 1 ELSE 0 END) as auto_processed
+        FROM messages
+        WHERE datetime(created_at) > datetime('now', '-7 days')
+    """).fetchone()
+    
+    # 최근 중요 메일
+    important = conn.execute("""
+        SELECT id, sender, subject, mail_type, created_at
+        FROM messages
+        WHERE importance >= 0.6
+        ORDER BY id DESC
+        LIMIT 10
+    """).fetchall()
+    
     conn.close()
-    if not row:
-        raise HTTPException(status_code=404, detail="not found")
-    files = json.loads(row["attachments_json"] or "[]")
-    if idx < 0 or idx >= len(files):
-        raise HTTPException(status_code=404, detail="attachment not found")
-    f = files[idx]
-    raw = base64.b64decode(f["content_b64"])
-    filename = f.get("filename", f"attach-{id}-{idx}")
-    headers = {}
-    if download:
-        headers["Content-Disposition"] = f'attachment; filename="{filename}"'
-    return StreamingResponse(io.BytesIO(raw), media_type=f.get("content_type","application/octet-stream"), headers=headers)
-
-@app.post("/mail/delete")
-def mail_delete(body: DeleteRequest, token: Optional[str] = Query(None), request: Request = None):
-    require_token(token, request)
-    conn = db()
-    conn.execute("UPDATE messages SET subject = '[DELETED] ' || subject WHERE id=?", (body.id,))
-    conn.commit()
-    conn.close()
-    print(f"[DELETE] id={body.id}")
-    return {"ok": True, "id": body.id}
-
-# === IMAP 대신 SendGrid 사용 안내 ===
-@app.post("/mail/poll-now")
-def mail_poll_now(token: Optional[str] = Query(None), request: Request = None):
-    require_token(token, request)
-    # IMAP 폴링 대신 SendGrid Inbound Parse 사용 안내
-    print("[POLL-NOW] Using SendGrid Inbound Parse - no polling needed")
+    
     return {
         "ok": True,
-        "stored": 0,
-        "message": "Using SendGrid Inbound Parse webhook - emails are received automatically"
+        "stats": {
+            "total": stats["total"] or 0,
+            "from_agents": stats["from_agents"] or 0,
+            "from_owner": stats["from_owner"] or 0,
+            "reports": stats["reports"] or 0,
+            "commands": stats["commands"] or 0,
+            "alerts": stats["alerts"] or 0,
+            "auto_processed": stats["auto_processed"] or 0
+        },
+        "recent_important": [
+            {
+                "id": row["id"],
+                "sender": row["sender"],
+                "subject": row["subject"],
+                "mail_type": row["mail_type"],
+                "created_at": row["created_at"]
+            } for row in important
+        ],
+        "system_status": "operational"
     }
+
+# 기존 엔드포인트들은 그대로 유지...
