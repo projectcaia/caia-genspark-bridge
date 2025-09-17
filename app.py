@@ -414,47 +414,67 @@ def tool_send(payload: ToolSendReq, token: Optional[str] = Query(None), request:
 @app.post("/inbound/sen")
 async def inbound_sen_enhanced(
     request: Request,
-    token: str = Query(...),
-    # 모든 필드를 Optional로 변경 (422 에러 해결)
-    from_field: Optional[str] = Form(None, alias="from"),
-    From: Optional[str] = Form(None),  # 대문자 버전
-    sender: Optional[str] = Form(None),  # 대체 필드
-    to: Optional[str] = Form(None),
-    To: Optional[str] = Form(None),  # 대문자 버전
-    subject: Optional[str] = Form(""),
-    Subject: Optional[str] = Form(None),  # 대문자 버전
-    text: Optional[str] = Form(""),
-    Text: Optional[str] = Form(None),  # 대문자 버전
-    html: Optional[str] = Form(None),
-    Html: Optional[str] = Form(None),  # 대문자 버전
-    attachments: Optional[List[UploadFile]] = File(None),
+    token: str = Query(...)
 ):
     if not INBOUND_TOKEN or token != INBOUND_TOKEN:
         raise HTTPException(status_code=401, detail="invalid inbound token")
     
-    # 필드 병합 (대소문자 호환)
-    from_field = from_field or From or sender or "unknown@sendgrid.com"
-    to = to or To or SENDER_DEFAULT
-    subject = subject or Subject or ""
-    text = text or Text or ""
-    html = html or Html
+    # Form 데이터를 직접 파싱 (필드명 문제 해결)
+    try:
+        form_data = await request.form()
+    except Exception as e:
+        print(f"[ERROR] Form parsing failed: {e}")
+        return {"ok": False, "error": "form_parsing_failed"}
+    
+    # 필드 추출 (대소문자 무관, 다양한 필드명 지원)
+    from_field = None
+    to = None
+    subject = ""
+    text = ""
+    html = None
+    
+    # 가능한 모든 필드명 체크
+    for key in form_data:
+        key_lower = key.lower()
+        value = form_data[key]
+        
+        if key_lower in ['from', 'sender', 'email']:
+            from_field = str(value)
+        elif key_lower in ['to', 'recipient']:
+            to = str(value)
+        elif key_lower in ['subject']:
+            subject = str(value)
+        elif key_lower in ['text', 'plain', 'body']:
+            text = str(value)
+        elif key_lower in ['html', 'html_body']:
+            html = str(value)
+    
+    # 디버그 로그
+    print(f"[INBOUND] Fields received: {list(form_data.keys())}")
+    print(f"[INBOUND] from={from_field}, to={to}, subject={subject[:50]}")
+    
+    # 기본값 설정
+    from_field = from_field or "unknown@sendgrid.com"
+    to = to or SENDER_DEFAULT
     
     # HTML to text 변환
     if not text and html:
         text = html_to_text(html)
     
+    # 첨부파일 처리
+    attachments = []
+    for key in form_data:
+        if 'attachment' in key.lower():
+            file = form_data[key]
+            if hasattr(file, 'filename'):
+                attachments.append({
+                    "filename": file.filename,
+                    "content_b64": b64_of_upload(file),
+                    "content_type": getattr(file, 'content_type', 'application/octet-stream')
+                })
+    
     # 메일 내용 분석
     analysis = analyze_and_classify_email(from_field, subject, text)
-    
-    # 첨부파일 처리
-    atts = []
-    if attachments:
-        for f in attachments:
-            atts.append({
-                "filename": f.filename,
-                "content_b64": b64_of_upload(f),
-                "content_type": f.content_type or "application/octet-stream"
-            })
     
     # DB 저장 (분석 결과 포함)
     now = dt.datetime.utcnow().isoformat()
@@ -466,7 +486,7 @@ async def inbound_sen_enhanced(
             sender_type, mail_type, auto_processed
         ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
     """, (
-        from_field, to, subject, text, html, json.dumps(atts), 
+        from_field, to, subject, text, html, json.dumps(attachments), 
         now, analysis.get("mail_type"), 
         1.0 if analysis["priority"] == "critical" else 0.6 if analysis["priority"] == "high" else 0.4,
         analysis["sender_type"], analysis["mail_type"], 
