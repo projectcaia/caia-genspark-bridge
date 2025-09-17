@@ -140,6 +140,20 @@ def simple_alert_parse(subject: Optional[str], text: Optional[str]):
             importance = min(1.0, importance + 0.15)
     return alert_class, importance
 
+
+def html_to_text(html: str) -> str:
+    """Very light HTML->text fallback: strip tags & unescape basic entities."""
+    try:
+        import html as _html
+        import re as _re
+        s = _re.sub(r'<br\s*/?>', '\n', html, flags=_re.I)
+        s = _re.sub(r'</p\s*>', '\n', s, flags=_re.I)
+        s = _re.sub(r'<[^>]+>', '', s)
+        s = _html.unescape(s)
+        return s.strip()
+    except Exception:
+        return (html or '').strip()
+
 def assistants_log_and_maybe_run(sender: str, recipients: str, subject: str, text: str, html: Optional[str]):
     if not (OPENAI_API_KEY and THREAD_ID and OpenAI):
         return {"thread_message_id": None, "run_id": None}
@@ -264,14 +278,14 @@ def send_via_sendgrid(payload: SendMailPayload):
     return getattr(resp, "status_code", None)
 
 def send_email(payload: SendMailPayload):
-    if sg:
-        try:
-            sc = send_via_sendgrid(payload)
-            return {"via": "sendgrid", "status_code": sc}
-        except Exception as e:
-            print("[SendGrid ERROR] fallback -> SMTP ::", e)
-    send_via_smtp(payload)
-    return {"via": "smtp", "status_code": 250}
+    if not sg:
+        raise HTTPException(status_code=500, detail="SendGrid not configured")
+    try:
+        sc = send_via_sendgrid(payload)
+        return {"via": "sendgrid", "status_code": sc}
+    except Exception as e:
+        print("[SendGrid ERROR]", e)
+        raise HTTPException(status_code=502, detail=f"SendGrid send failed: {e}")
 
 # ===== Routes =====
 
@@ -285,7 +299,7 @@ def health():
         "ok": True,
         "version": APP_VER,
         "sender": SENDER_DEFAULT,
-        "smtp_user": SMTP_USER,
+        "smtp_user": None,
         "sendgrid": bool(sg),
         "inbound": "sendgrid"  # IMAP 제거, SendGrid Inbound Parse 사용
     }
@@ -300,7 +314,7 @@ def status(token: Optional[str] = Query(None), request: Request = None):
         "ok": True,
         "version": APP_VER,
         "messages": cnt,
-        "smtp_user": SMTP_USER,
+        "smtp_user": None,
         "sendgrid": bool(sg),
         "inbound": "sendgrid"
     }
@@ -334,7 +348,11 @@ async def inbound(
     if not INBOUND_TOKEN or token != INBOUND_TOKEN:
         raise HTTPException(status_code=401, detail="invalid inbound token")
 
-    atts = []
+        # Fallback: if no text but html exists, generate text from html
+    if not text and html:
+        text = html_to_text(html)
+
+atts = []
     if attachments:
         for f in attachments:
             atts.append({
@@ -382,7 +400,11 @@ async def inbound_sen(
     to = to or SENDER_DEFAULT
 
     # 첨부파일 처리
-    atts = []
+        # Fallback: if no text but html exists, generate text from html
+    if not text and html:
+        text = html_to_text(html)
+
+atts = []
     if attachments:
         for f in attachments:
             atts.append({
