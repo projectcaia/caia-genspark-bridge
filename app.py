@@ -594,14 +594,45 @@ def status(token: Optional[str] = Query(None), request: Request = None):
 @app.post("/tool/send")
 def tool_send(payload: ToolSendReq, token: Optional[str] = Query(None), request: Request = None):
     require_token(token, request)
+    
+    # 디버깅: 받은 데이터 확인
+    print(f"[DEBUG] Raw payload: {payload}")
+    print(f"[DEBUG] payload.to type: {type(payload.to)}")
+    print(f"[DEBUG] payload.to value: {payload.to}")
+    
+    # to 필드 타입 체크 및 변환
+    to_list = payload.to
+    if isinstance(to_list, str):
+        # 문자열이면 리스트로 변환
+        to_list = [to_list]
+        print(f"[DEBUG] Converted string to list: {to_list}")
+    elif not isinstance(to_list, list):
+        # 리스트도 문자열도 아니면 강제 변환
+        to_list = [str(to_list)]
+        print(f"[DEBUG] Force converted to list: {to_list}")
+    
+    # 이메일 주소 정리 (공백 제거 등)
+    to_list = [email.strip() for email in to_list if email and email.strip()]
+    
+    if not to_list:
+        raise HTTPException(status_code=400, detail="No valid recipients")
+    
+    print(f"[DEBUG] Final to_list: {to_list}")
+    
+    # SendMailPayload 생성
     model = SendMailPayload(
-        to=payload.to,
+        to=to_list,  # 정리된 리스트 사용
         subject=payload.subject,
         text=payload.text,
         html=payload.html,
     )
+    
+    # 메일 발송
     res = send_email(model)
-    print(f"[TOOL-SEND] via={res['via']} to={','.join(payload.to)} subject={payload.subject}")
+    
+    # 로그
+    print(f"[TOOL-SEND] via={res['via']} to={','.join(to_list)} subject={payload.subject} status={res.get('status_code')}")
+    
     return {"ok": True, **res}
 
 # === 지능형 Inbound 처리 (완전 개선) ===
